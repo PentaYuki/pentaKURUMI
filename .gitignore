@@ -1,0 +1,56 @@
+# .gitignore for PentaAI Project (pentaKURUMI)
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Large Models & AI Data (EXCLUDE from Git)
+PentaAI_Mac/data/model_cache/
+PentaAI_Mac/tts_engine/voicevox/models/*.vvm
+PentaAI_Mac/tts_engine/voicevox/*.dylib
+PentaAI_Mac/tts_engine/voicevox/open_jtalk_dic_utf_8-1.11/sys.dic
+
+# Personal User Data / State (EXCLUDE from Git)
+PentaAI_Mac/data/*.json
+!PentaAI_Mac/data/knowledge.json  # Optional: Keep knowledge if it is static
+PentaAI_Mac/config.json
+
+# Xcode / Swift generated files
+*.swp
+*.lock
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+xcuserdata/
+DerivedData/
+*.moved-aside
+*.xcuserstate
+*.xcworkspace/
+!*.xcworkspace/contents.xcworkspacedata
+# Ignore project level user settings
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/
+
+# Python Virtual Environment
+venv/
+.venv/
+env/
+.env/
+
+# Temp files
+tmp/
+/tmp/
+data/semantic_cache.json
+data/episodic_memory.json
+data/hormone_state.json
+data/user_profile.json

@@ -1,0 +1,11 @@
+{
+  "auth_token": "abc",
+  "tuya_device_id": "a302e2ffce2957e759pajf",
+  "tuya_local_key": "4Vgvg$X:;r0u0H3!",
+  "tuya_ip": "192.168.1.64",
+  "tuya_version": 3.3,
+  "pc_tailscale_ip": "100.116.207.30",
+  "pc_mac_address": "AA:BB:CC:DD:EE:FF",
+  "pc_ssh_user": "username",
+  "pc_ai_port": "9090"
+}
