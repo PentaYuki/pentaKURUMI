@@ -220,9 +220,11 @@ class VoiceEngine: NSObject, ObservableObject {
     func sendTextToAI(_ text: String) {
         transitionTo(.responding)
         aiResponseText = ""
+        let wsMode = (commandMode == .chat) ? "chat" : "cmd"
 
         networkManager.sendChatWS(
             text:    text,
+            mode:    wsMode,
             onText:  { [weak self] responseText, latencyMs in
                 guard let self else { return }
                 self.aiResponseText = responseText
@@ -253,39 +255,8 @@ class VoiceEngine: NSObject, ObservableObject {
 
     func sendTextFromKeyboard(_ text: String) {
         guard !isPlayingAudio else { return }
-        if commandMode == .device {
-            // Chế độ lệnh: gửi đến PentaKuru
-            let pentaKuruURL = UserDefaults.standard.string(forKey: "penta_kuru_url") ?? ""
-            if !pentaKuruURL.isEmpty {
-                statusMessage = "📡 Gửi lệnh đến PentaKuru..."
-                networkManager.sendPentaKuruCommandViaAI(text: text) { [weak self] result in
-                    DispatchQueue.main.async {
-                        guard let self else { return }
-                        if result.ok {
-                            self.statusMessage = "✓ Lệnh đã thực thi"
-                            self.aiResponseText = result.stdout.isEmpty ? "Thành công" : result.stdout
-                        } else {
-                            self.statusMessage = "✗ Lỗi: \(result.stderr)"
-                            self.aiResponseText = "Lỗi: \(result.stderr)"
-                        }
-                        self.hapticResult(result.ok)
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                            self.returnToIdle()
-                        }
-                    }
-                }
-            } else {
-                statusMessage = "⚠️ Chưa cấu hình PentaKuru URL"
-                aiResponseText = "Vào Settings, thêm URL PentaKuru (máy Windows) để dùng lệnh."
-                hapticResult(false)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-                    self.returnToIdle()
-                }
-            }
-        } else {
-            // Chế độ chat: gửi đến Windows AI
-            sendTextToAI(text)
-        }
+        // Thin client: app chỉ chọn mode (chat/cmd), backend chịu trách nhiệm xử lý.
+        sendTextToAI(text)
     }
     // MARK: - ⭐ Audio Session (FIX v3.1)
 
@@ -435,7 +406,8 @@ class VoiceEngine: NSObject, ObservableObject {
         let text = pendingText.trimmingCharacters(in: .whitespaces)
         guard !text.isEmpty else { returnToIdle(); return }
         lastRecognized = text; transitionTo(.executing)
-        commandMode == .chat ? sendTextToAI(text) : matchAndSendCommand(text)
+        // Thin client: voice path cũng đi thẳng WS + mode.
+        sendTextToAI(text)
     }
 
     private func matchAndSendCommand(_ text: String) {

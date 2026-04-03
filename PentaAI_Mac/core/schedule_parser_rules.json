@@ -1,0 +1,118 @@
+{
+  "extra_day_aliases": {
+    "t2": "monday",
+    "t3": "tuesday",
+    "t4": "wednesday",
+    "t5": "thursday",
+    "t6": "friday",
+    "t7": "saturday",
+    "cnhat": "sunday"
+  },
+  "setup_trigger_phrases": [
+    "sắp lịch",
+    "xếp lịch",
+    "lên lịch",
+    "tạo lịch",
+    "tao lich",
+    "lịch trình",
+    "schedule",
+    "kế hoạch tuần"
+  ],
+  "query_phrases": [
+    "xem lịch",
+    "lịch tuần",
+    "lịch trình",
+    "show schedule",
+    "thời khóa biểu",
+    "thời biểu"
+  ],
+  "done_phrases": [
+    "được rồi em",
+    "duoc roi em",
+    "xong rồi",
+    "xong nha",
+    "thế thôi",
+    "the thoi",
+    "done",
+    "ok em",
+    "đủ rồi"
+  ],
+  "exit_phrases": [
+    "thoát lịch",
+    "tạm dừng lịch",
+    "dừng lịch",
+    "hủy lịch",
+    "cancel schedule"
+  ],
+  "resume_phrases": [
+    "tiếp tục lịch",
+    "quay lại lịch",
+    "resume schedule",
+    "xếp lịch tiếp"
+  ],
+  "flow_prompts": {
+    "guard": {
+      "vi": [
+        "Em vẫn đang lên lịch cho anh nè... mình tiếp tục hay dừng tạm vậy anh?",
+        "Ơ kìa, lịch mình chưa xong mà anh đổi chủ đề rồi. Anh muốn làm tiếp hay tạm dừng nha?",
+        "Em hơi dỗi xíu vì lịch còn dang dở đó. Mình tiếp tục lịch luôn hay dừng lại anh?"
+      ],
+      "en": [
+        "I'm still setting up your schedule, hehe. Do we continue or pause for now?",
+        "Aww, we haven't finished the schedule yet. Want to keep going or stop here?",
+        "Tiny sulky mode on because the schedule is unfinished. Continue or pause, boss?"
+      ],
+      "jp": [
+        "まだ予定を作成中だよ。続ける？それともいったん止める？",
+        "えへへ、まだスケジュール終わってないの。続きやる？それとも休憩する？",
+        "ちょっとだけ拗ねちゃうよ、予定が未完了なんだもん。続ける？止める？"
+      ]
+    },
+    "pause_auto": {
+      "vi": [
+        "Em đoán anh đang muốn nói chuyện khác nên em tạm dừng lịch nha. Khi nào cần, anh nói 'tiếp tục lịch' là em làm tiếp liền.",
+        "Thôi được rồi, em tạm cất bản nháp lịch trước nè. Anh gọi 'tiếp tục lịch' là em quay lại ngay.",
+        "Em giữ nguyên lịch dang dở cho anh rồi nhé. Lát anh nói 'tiếp tục lịch' là mình làm tiếp luôn."
+      ],
+      "en": [
+        "Looks like you're switching topics, so I'll pause scheduling and keep your draft safe. Say 'resume schedule' anytime.",
+        "Okay, I'll park the schedule draft for now. Just say 'resume schedule' and we'll continue.",
+        "No worries, I saved the unfinished schedule draft. Say 'resume schedule' when you're ready."
+      ],
+      "jp": [
+        "話題が変わったみたいだから、予定作成は一旦止めて下書きを保存しておくね。『スケジュール再開』で続けられるよ。",
+        "いったん予定は保留にして、下書きはちゃんと残しておくね。再開したい時に言ってね。",
+        "大丈夫、未完了の予定は保存してあるよ。『再開』って言ってくれたらすぐ続けるね。"
+      ]
+    }
+  },
+  "empty_phrases": [
+    "không",
+    "khong",
+    "để trống",
+    "de trong",
+    "tạm để trống",
+    "skip",
+    "bo qua"
+  ],
+  "day_query_markers": [
+    "làm gì",
+    "có gì",
+    "rảnh không",
+    "như thế nào",
+    "lịch",
+    "lich",
+    "schedule"
+  ],
+  "connectors": [
+    ",",
+    ";",
+    "|",
+    "\\n",
+    " và ",
+    " va ",
+    " rồi ",
+    " sau đó ",
+    " tiếp theo "
+  ]
+}

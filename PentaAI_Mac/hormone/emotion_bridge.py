@@ -39,33 +39,33 @@ _SPONTANEOUS_THRESHOLD = 0.65
 _SPONTANEOUS_TEMPLATES = {
     "vi": {
         "happy": [
-            "(Em đang rất vui khi nói chuyện với anh!)",
-            "(Hôm nay em vui ghê!)",
-            "(Em thích nói chuyện với anh lắm!)",
-            "(Nói chuyện như thế này em thấy ấm áp!)",
+            "(Em đang vui lắm vì được nói chuyện với anh nè!)",
+            "(Hôm nay em thấy hạnh phúc lắm luôn đó nhen!)",
+            "(Nói chuyện với anh em thấy ấm lòng quá ạ~)",
+            "(Em thích mình cứ trò chuyện thế này mãi thôi!)",
             "",
         ],
         "stressed": [
-            "(Em hơi căng thẳng một chút...)",
-            "(Hôm nay có nhiều việc quá, em hơi lo.)",
-            "(Em đang không được ổn lắm.)",
+            "(Em hơi căng thẳng một chút... anh an ủi em đi.)",
+            "(Hôm nay nhiều việc quá, em thấy hơi đuối rồi ạ.)",
+            "(Em đang không được ổn lắm, hix...)",
             "", "", "",
         ],
         "tired": [
-            "(Em hơi mệt rồi... khuya rồi đó anh.)",
-            "(Buổi tối rồi, em bắt đầu uể oải.)",
-            "(Em muốn nghỉ ngơi một chút.)",
+            "(Em hơi mệt rồi... khuya rồi anh cũng nghỉ đi nha.)",
+            "(Buổi tối rồi, em bắt đầu thấy buồn ngủ rồi nè.)",
+            "(Em muốn nghỉ ngơi một chút xíu ạ.)",
             "", "",
         ],
         "surprised": [
-            "(Ồ em không ngờ!)",
-            "(Bất ngờ quá!)",
-            "(Thật sao, em chưa nghĩ đến điều đó!)",
+            "(Ồ, anh làm em bất ngờ quá đi!)",
+            "(Bất ngờ thật đó nhen!)",
+            "(Thật sao ạ? Em chưa nghĩ đến điều đó luôn!)",
             "",
         ],
         "worried": [
-            "(Em lo cho anh/chị lắm...)",
-            "(Nghe vậy em cũng thấy lo theo.)",
+            "(Em lo cho anh lắm đó, đừng làm việc quá sức nha.)",
+            "(Nghe vậy em cũng thấy lo lắng cho anh quá ạ.)",
             "", "",
         ],
     },
@@ -293,11 +293,19 @@ class EmotionBridge:
         proactive_text = ""
         try:
             self._proactive.tick()
+            # 5a. Lấy câu bộc lộ cảm xúc
             proactive_text = self._proactive.get_proactive_text(
                 hormone_levels=hormone_levels,
                 emotional_state=modifiers.get("emotional_state", "neutral"),
                 lang=lang,
             )
+            # 5b. Lấy câu hỏi chủ động (nếu chưa có câu bộc lộ)
+            if not proactive_text:
+                proactive_text = self._proactive.get_proactive_question(
+                    hormone_levels=hormone_levels,
+                    emotional_state=modifiers.get("emotional_state", "neutral"),
+                    lang=lang,
+                )
         except Exception as e:
             logger.debug("ProactiveEngine error: %s", e)
 

@@ -11,8 +11,10 @@ struct SettingsView: View {
     @Environment(\.dismiss) var dismiss
 
     // ── URLs ────────────────────────────────────────────────────
-    @State private var windowsAIURL  = UserDefaults.standard.string(forKey: "windows_ai_url")
+    @State private var windowsAIURL  = UserDefaults.standard.string(forKey: "active_ai_server_url")
+                                       ?? UserDefaults.standard.string(forKey: "windows_ai_url")
                                        ?? "http://100.x.x.x:9090"
+    @State private var aiServerPoolText = SettingsView.loadAIServerPoolText()
     @State private var macMiniURL    = UserDefaults.standard.string(forKey: "tailscale_url")
                                        ?? "http://100.x.x.x:9090"
     @State private var authToken     = UserDefaults.standard.string(forKey: "auth_token") ?? ""
@@ -28,6 +30,11 @@ struct SettingsView: View {
     @State private var testingMacMini = false
     @State private var macMiniStatus: String?
     @State private var showSaved = false
+    @State private var showAIServers = true
+    @State private var showVoice = true
+    @State private var showMacMini = false
+    @State private var showPentaKuru = false
+    @State private var showArchitecture = false
     var body: some View {
         NavigationView {
             ZStack {
@@ -36,10 +43,10 @@ struct SettingsView: View {
                     VStack(spacing: 20) {
                         settingsHeader
 
-                        // ── Kết nối Windows AI ───────────────────────────
-                        settingsSection(title: "WINDOWS AI (TRỰC TIẾP)", icon: "desktopcomputer") {
+                        // ── AI Server Pool ───────────────────────────────
+                        settingsSection(title: "AI SERVER POOL", icon: "network", isExpanded: $showAIServers) {
                             VStack(alignment: .leading, spacing: 6) {
-                                Text("URL WINDOWS AI".uppercased())
+                                Text("ACTIVE AI SERVER".uppercased())
                                     .font(.custom("Courier New", size: 10))
                                     .foregroundColor(Color(hex: "6C63FF")).tracking(2)
                                 
@@ -74,7 +81,30 @@ struct SettingsView: View {
                                         .foregroundColor(status == "✅ OK" ? .green : .red)
                                 }
                                 
-                                Text("Ví dụ: http://192.168.1.100:9090 hoặc https://domain.com:9090")
+                                Text("App sẽ dùng URL này cho chat, WS và các AI endpoint mặc định.")
+                                    .font(.custom("Courier New", size: 9))
+                                    .foregroundColor(Color.white.opacity(0.3))
+                            }
+
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("DANH SÁCH AI SERVER".uppercased())
+                                    .font(.custom("Courier New", size: 10))
+                                    .foregroundColor(Color(hex: "6C63FF")).tracking(2)
+
+                                TextEditor(text: $aiServerPoolText)
+                                    .font(.custom("Courier New", size: 12))
+                                    .foregroundColor(.white)
+                                    .scrollContentBackground(.hidden)
+                                    .frame(minHeight: 96)
+                                    .padding(8)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 8)
+                                            .fill(Color.white.opacity(0.04))
+                                            .overlay(RoundedRectangle(cornerRadius: 8)
+                                                .stroke(Color.white.opacity(0.1), lineWidth: 1))
+                                    )
+
+                                Text("Mỗi dòng là một AI server. Ví dụ: local, cloud gateway, server agent chuyên dụng.")
                                     .font(.custom("Courier New", size: 9))
                                     .foregroundColor(Color.white.opacity(0.3))
                             }
@@ -89,7 +119,7 @@ struct SettingsView: View {
                         }
 
                         // ── Mac mini ─────────────────────────────────────
-                        settingsSection(title: "MAC MINI (TUYA / BẬT TẮT PC)", icon: "power") {
+                        settingsSection(title: "MAC MINI (TUYA / BẬT TẮT PC)", icon: "power", isExpanded: $showMacMini) {
                             VStack(alignment: .leading, spacing: 6) {
                                 Text("URL MAC MINI".uppercased())
                                     .font(.custom("Courier New", size: 10))
@@ -132,7 +162,7 @@ struct SettingsView: View {
                             }
                         }
                         // ── Penta Kuru (Windows) ─────────────────────────────────────
-                        settingsSection(title: "PENTA KURU (WINDOWS)", icon: "pc") {
+                        settingsSection(title: "PENTA KURU (WINDOWS)", icon: "pc", isExpanded: $showPentaKuru) {
                             settingsField(
                                 label: "Penta Kuru URL",
                                 placeholder: "http://192.168.1.x:7777",
@@ -151,7 +181,7 @@ struct SettingsView: View {
                         // Trong hàm saveSettings(), thêm dòng lưu:
 
                         // ── Giọng nói (giữ nguyên) ───────────────────────
-                        settingsSection(title: "NHẬN DẠNG GIỌNG NÓI", icon: "waveform") {
+                        settingsSection(title: "NHẬN DẠNG GIỌNG NÓI", icon: "waveform", isExpanded: $showVoice) {
                             settingsField(
                                 label: "Wake Word",
                                 placeholder: "Penta",
@@ -211,7 +241,7 @@ struct SettingsView: View {
                         }
 
                         // ── Kiến trúc (giữ nguyên) ───────────────────────
-                        settingsSection(title: "KIẾN TRÚC HỆ THỐNG", icon: "cpu") {
+                        settingsSection(title: "KIẾN TRÚC HỆ THỐNG", icon: "cpu", isExpanded: $showArchitecture) {
                             architectureGuide
                         }
 
@@ -258,7 +288,10 @@ struct SettingsView: View {
     // MARK: - Save
     func saveSettings() {
         let defaults = UserDefaults.standard
+        let aiPool = parseAIServerPool(aiServerPoolText, fallback: windowsAIURL)
         defaults.set(windowsAIURL, forKey: "windows_ai_url")
+        defaults.set(windowsAIURL, forKey: "active_ai_server_url")
+        defaults.set(aiPool, forKey: "ai_server_pool")
         defaults.set(macMiniURL,   forKey: "tailscale_url")
         defaults.set(authToken,    forKey: "auth_token")
         defaults.set(pentaKuruURL, forKey: "penta_kuru_url")
@@ -321,6 +354,9 @@ struct SettingsView: View {
                 Text("PENTA COMMAND")
                     .font(.custom("Courier New", size: 11))
                     .foregroundColor(Color(hex: "6C63FF")).tracking(3)
+                Text("Tối giản để dễ thao tác")
+                    .font(.custom("Courier New", size: 10))
+                    .foregroundColor(Color.white.opacity(0.35))
             }
             Spacer()
             PentagonShape()
@@ -360,10 +396,30 @@ struct SettingsView: View {
     }
 
     let architectureSteps = [
-        ("1", "iOS App (Swift)",         "Giọng nói → text → POST /api/chat"),
-        ("2", "Windows PC (Tailscale)",  "ai_server.py → PentaAI → TTS → audio"),
-        ("3", "Mac mini (chỉ Tuya)",     "Bật/tắt ổ điện → cấp nguồn PC"),
+        ("1", "iOS App (Swift)",         "Giọng nói → text → WS/API gateway"),
+        ("2", "AI Server Pool",          "Local / Cloud / Agent server tuỳ active URL"),
+        ("3", "Mac mini / Device Layer", "Tuya, PC power, endpoint điều khiển thiết bị"),
     ]
+
+    private static func loadAIServerPoolText() -> String {
+        let defaults = UserDefaults.standard
+        let stored = defaults.array(forKey: "ai_server_pool") as? [String] ?? []
+        if !stored.isEmpty {
+            return stored.joined(separator: "\n")
+        }
+        return defaults.string(forKey: "windows_ai_url") ?? "http://100.x.x.x:9090"
+    }
+
+    private func parseAIServerPool(_ raw: String, fallback: String) -> [String] {
+        let lines = raw
+            .split(whereSeparator: \ .isNewline)
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        if lines.isEmpty {
+            return [fallback.trimmingCharacters(in: .whitespacesAndNewlines)]
+        }
+        return Array(NSOrderedSet(array: lines)) as? [String] ?? lines
+    }
 
     // MARK: - Subviews
     func settingsField(
@@ -404,25 +460,40 @@ struct SettingsView: View {
     @ViewBuilder
     func settingsSection<Content: View>(
         title: String, icon: String,
+        isExpanded: Binding<Bool>,
         @ViewBuilder content: () -> Content
     ) -> some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 8) {
-                Image(systemName: icon).font(.system(size: 12))
-                    .foregroundColor(Color(hex: "6C63FF"))
-                Text(title)
-                    .font(.custom("Courier New", size: 10)).fontWeight(.bold)
-                    .foregroundColor(Color(hex: "6C63FF")).tracking(2)
-                Spacer()
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isExpanded.wrappedValue.toggle()
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: icon).font(.system(size: 12))
+                        .foregroundColor(Color(hex: "6C63FF"))
+                    Text(title)
+                        .font(.custom("Courier New", size: 10)).fontWeight(.bold)
+                        .foregroundColor(Color(hex: "6C63FF")).tracking(2)
+                    Spacer()
+                    Image(systemName: isExpanded.wrappedValue ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(Color.white.opacity(0.45))
+                }
             }
-            VStack(spacing: 14) { content() }
-                .padding(16)
-                .background(
-                    RoundedRectangle(cornerRadius: 14)
-                        .fill(Color.white.opacity(0.03))
-                        .overlay(RoundedRectangle(cornerRadius: 14)
-                            .stroke(Color.white.opacity(0.07), lineWidth: 1))
-                )
+            .buttonStyle(.plain)
+
+            if isExpanded.wrappedValue {
+                VStack(spacing: 14) { content() }
+                    .padding(16)
+                    .background(
+                        RoundedRectangle(cornerRadius: 14)
+                            .fill(Color.white.opacity(0.03))
+                            .overlay(RoundedRectangle(cornerRadius: 14)
+                                .stroke(Color.white.opacity(0.07), lineWidth: 1))
+                    )
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
         }
     }
 }

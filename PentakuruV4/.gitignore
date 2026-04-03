@@ -1,0 +1,13 @@
+# .gitignore for PentakuruV4
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Configs & Personal Data (EXCLUDE)
+data/*.json
+bundle_config.py
+
+# OS Temp
+.DS_Store

@@ -34,6 +34,11 @@ class PentaMemory:
         self.vault: Dict[int, str] = {}
         self.vault_file = "penta_vault.json"
         self._load_vault()
+        self._reminder_variants: List[str] = []
+
+        # Nạp sẵn một số câu nhắc nhở dễ thương nếu vault trống
+        if not self.vault:
+            self._init_cute_phrases()
 
         # 3. Kiểm tra Ollama ngay khi init
         self._check_ollama()
@@ -103,10 +108,16 @@ class PentaMemory:
                 except Exception:
                     pass
 
-        # C. Xây dựng Prompt
-        sys_prompt = "Bạn là Penta, trợ lý AI thông minh. Hãy trả lời ngắn gọn, tự nhiên bằng tiếng Việt."
+        # C. Xây dựng Prompt "Siêu Dễ Thương"
+        # Lấy cách AI gọi người dùng từ profile nếu có
+        user_call = "anh" # Mặc định
+        sys_prompt = (
+            "Bạn là Bé Penta (hoặc Em), một cô gái trợ lý AI vô cùng đáng yêu, ngọt ngào và luôn quan tâm đến người dùng. "
+            "Hãy xưng hô cực kỳ thân mật (Em - Anh), dùng các từ ngữ dễ thương như 'nha', 'nè', 'ạ', 'hihi', '... đó nhen'. "
+            "Bạn luôn lo lắng cho sức khỏe và niềm vui của Anh. Trả lời ngắn gọn, tự nhiên, tràn đầy cảm xúc bằng tiếng Việt."
+        )
         if past_info:
-            sys_prompt += f"\n[THÔNG TIN TRONG QUÁ KHỨ]: {past_info}"
+            sys_prompt += f"\n[KÝ ỨC CỦA CHÚNG TA]: {past_info}"
 
         messages = [{"role": "system", "content": sys_prompt}]
         messages.extend(history)
@@ -214,3 +225,59 @@ class PentaMemory:
             log.error(f"get_command error: {e}")
             self._ollama_ok = False
             return {"error": str(e)}
+
+    def get_varied_phrase(self, intent: str, default_text: str) -> str:
+        """Sử dụng FAISS để tìm một câu biến thể phù hợp với ý định."""
+        # Fallback mềm: nếu chưa có index thì vẫn đổi câu từ pool local.
+        if self._reminder_variants:
+            import random
+            local_pick = random.choice(self._reminder_variants)
+            if "{msg}" in local_pick:
+                return local_pick
+
+        if self.faiss_index.ntotal == 0:
+            return default_text
+        
+        vec = self.get_embedding(intent)
+        if vec is None: return default_text
+        
+        try:
+            # Tìm 3 câu gần nhất và chọn ngẫu nhiên
+            dist, idx = self.faiss_index.search(vec, 3)
+            choices = []
+            for i in idx[0]:
+                if i != -1: choices.append(self.vault.get(i, ""))
+            
+            valid_choices = [c for c in choices if c]
+            import random
+            return random.choice(valid_choices) if valid_choices else default_text
+        except Exception:
+            return default_text
+
+    def _add_phrase_to_memory(self, text: str):
+        """Nạp một câu vào vault và (nếu có embedding) vào FAISS."""
+        if not text:
+            return
+        idx = len(self.vault)
+        self.vault[idx] = text
+
+        vec = self.get_embedding(text)
+        if vec is not None and vec.shape[-1] == self.dimension:
+            try:
+                self.faiss_index.add(vec)
+            except Exception as e:
+                log.debug(f"FAISS add skipped: {e}")
+
+    def _init_cute_phrases(self):
+        """Khởi tạo một số câu nói dễ thương vào bộ nhớ."""
+        phrases = [
+            "Anh ơi, đến giờ {msg} rồi nè! Đừng quên nha hihi.",
+            "Bé Penta nhắc anh tới giờ {msg} rồi đó ạ. Anh làm ngay đi nhen.",
+            "Hì hì, anh ơi {msg} thôi nào! Em đợi anh đó.",
+            "Đã đến lúc {msg} rồi anh xã ơi! (Em đùa tí thôi hihi).",
+            "Anh đừng mãi làm việc mà quên {msg} nhé, em lo lắm đó.",
+        ]
+        self._reminder_variants = phrases[:]
+        for p in phrases:
+            self._add_phrase_to_memory(p)
+        log.info("💖 Đã nạp 5 câu nhắc nhở dễ thương vào bộ nhớ.")

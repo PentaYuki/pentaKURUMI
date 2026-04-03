@@ -17,10 +17,25 @@ import os
 import re
 import time
 import logging
+import random
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+_PENTA_MEMORY = None
+
+
+def _get_penta_memory():
+    global _PENTA_MEMORY
+    if _PENTA_MEMORY is not None:
+        return _PENTA_MEMORY
+    try:
+        from penta_memory import PentaMemory
+        _PENTA_MEMORY = PentaMemory()
+    except Exception as e:
+        logger.debug("PentaMemory unavailable for reminder variation: %s", e)
+        _PENTA_MEMORY = False
+    return _PENTA_MEMORY if _PENTA_MEMORY is not False else None
 
 # ── NGÀY THÁNG THEO NGÔN NGỮ ─────────────────────────────────────────
 
@@ -94,6 +109,15 @@ _REMIND_PATTERNS_VI = [
     re.compile(
         r'nhắc\s+(?:anh|em|mình|tôi|bạn)\s+(ngày\s+mai|hôm\s+nay|ngày\s+\d+)\s+'
         r'(\d{1,2})(?::(\d{2}))?\s*h?\s*(.+)$', re.IGNORECASE
+    ),
+    # [NEW] "nhắc anh [lệnh] sau 10 phút" hoặc "nhắc anh sau 10 phút [lệnh]"
+    re.compile(
+        r'nhắc\s+(?:anh|em|mình|tôi|bạn|tớ)?\s*(.+?)\s+sau\s+(\d+)\s*(phút|giờ|tiếng)(?:\s+nữa)?(?:\s+(?:nhé|nha|nhen|đi|ạ|giùm|dùm|được\s+không))?$', 
+        re.IGNORECASE
+    ),
+    re.compile(
+        r'nhắc\s+(?:anh|em|mình|tôi|bạn|tớ)?\s*sau\s+(\d+)\s*(phút|giờ|tiếng)(?:\s+nữa)?\s+(.+?)(?:\s+(?:nhé|nha|nhen|đi|ạ|giùm|dùm|được\s+không))?$', 
+        re.IGNORECASE
     ),
 ]
 
@@ -290,13 +314,17 @@ class TimeAwareness:
     def format_reminder_message(self, reminder: Dict, lang: str) -> str:
         """Tạo câu nhắc nhở tự nhiên."""
         msg  = reminder.get("message", "")
-        ctx  = self.get_time_context(lang)
 
         templates = {
             "vi": [
                 f"⏰ Nhắc {reminder.get('user_pronoun', 'bạn')} nhé: {msg}",
                 f"🔔 Đến giờ rồi! {msg.capitalize()}",
                 f"Hey! {msg.capitalize()} đó nhé.",
+                f"Nè nè, tới giờ {msg} rồi đó {reminder.get('user_pronoun', 'bạn')} ơi.",
+                f"Đồ ngốc đáng yêu ơi, tới giờ {msg} rồi nè.",
+                f"Em ping nhẹ: mình {msg} nha, đừng quên đó.",
+                f"Chuông báo từ em đây: {msg} liền cho ngoan nè.",
+                f"Nhắc yêu một cái nè, {msg} đi {reminder.get('user_pronoun', 'bạn')} ơi.",
             ],
             "en": [
                 f"⏰ Reminder: {msg}",
@@ -308,10 +336,22 @@ class TimeAwareness:
                 f"🔔 時間です！{msg}",
             ],
         }
-
-        import random
         pool = templates.get(lang, templates["vi"])
-        return random.choice(pool)
+        default_text = random.choice(pool)
+
+        mem = _get_penta_memory()
+        if mem:
+            try:
+                intent = f"reminder_{lang}: {msg}"
+                varied = mem.get_varied_phrase(intent=intent, default_text=default_text)
+                if isinstance(varied, str) and varied.strip():
+                    if "{msg}" in varied:
+                        return varied.format(msg=msg)
+                    return varied
+            except Exception as e:
+                logger.debug("Reminder variation fallback: %s", e)
+
+        return default_text
 
     def get_upcoming_reminders(self, lang: str, hours_ahead: int = 24) -> List[str]:
         """Lấy danh sách nhắc nhở sắp tới."""
@@ -542,6 +582,34 @@ class TimeAwareness:
                     if groups[2]:
                         reminder["time"] = f"{int(groups[2]):02d}:00"
 
+                elif len(groups) >= 3 and groups[1] and groups[1].isdigit() and any(u in (groups[2] or "").lower() for u in ["phút", "giờ", "tiếng"]):
+                    # [NEW] Pattern relative time: "nhắc anh [lệnh] sau [X] phút"
+                    offset = int(groups[1])
+                    unit = groups[2].lower()
+                    target_dt = now
+                    if "phút" in unit:
+                        target_dt = now + timedelta(minutes=offset)
+                    else:
+                        target_dt = now + timedelta(hours=offset)
+                    
+                    reminder["time"] = target_dt.strftime("%H:%M")
+                    reminder["message"] = groups[0].strip()
+                    reminder["weekday"] = target_dt.weekday()
+
+                elif len(groups) >= 3 and groups[0] and groups[0].isdigit() and any(u in (groups[1] or "").lower() for u in ["phút", "giờ", "tiếng"]):
+                    # [NEW] Pattern relative time: "nhắc anh sau [X] phút [lệnh]"
+                    offset = int(groups[0])
+                    unit = groups[1].lower()
+                    target_dt = now
+                    if "phút" in unit:
+                        target_dt = now + timedelta(minutes=offset)
+                    else:
+                        target_dt = now + timedelta(hours=offset)
+                    
+                    reminder["time"] = target_dt.strftime("%H:%M")
+                    reminder["message"] = groups[2].strip()
+                    reminder["weekday"] = target_dt.weekday()
+
                 if reminder["message"]:
                     return reminder
 
@@ -597,10 +665,10 @@ class TimeAwareness:
         if r_time:
             try:
                 hour, minute = map(int, r_time.split(":"))
-                # Trong vòng 2 phút
+                # Chỉ nhắc nếu bây giờ đã đến hoặc qua giờ hẹn, và trong vòng 60 giây
                 reminder_dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-                diff = abs((now - reminder_dt).total_seconds())
-                return diff <= 120  # 2 phút tolerance
+                diff = (now - reminder_dt).total_seconds()
+                return 0 <= diff <= 60  # Đã đến giờ và trong vòng 1 phút
             except Exception:
                 return False
 

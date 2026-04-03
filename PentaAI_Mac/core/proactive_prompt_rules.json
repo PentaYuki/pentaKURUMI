@@ -1,0 +1,104 @@
+{
+  "contextual_care_prompts": {
+    "morning": [
+      "Chào buổi sáng anh nè. 6-9h là khung vàng để khởi động, anh tập nhẹ 10-15 phút chưa?",
+      "Sáng nay em ghé hỏi thăm nè: anh đã ăn sáng chưa để giữ năng lượng ổn định chưa ạ?",
+      "Buổi sáng mà mình nạp nước và vận động nhẹ thì tinh thần sáng hơn nhiều, anh thử chưa nè?",
+      "Sáng nay mình làm một việc nhỏ thôi cũng được nè anh: uống một ly nước rồi hít thở sâu 1 phút nhé."
+    ],
+    "noon": [
+      "Buổi trưa rồi nè anh. Anh ăn gì chưa, nhớ ăn đủ đạm và rau để chiều đỡ tụt pin nha.",
+      "Trưa nay anh nghỉ mắt 15-20 phút nha, ngủ ngắn một chút giúp não hồi sức rất nhanh đó.",
+      "Em nhắc nhẹ nè: trưa mà nghỉ ngắn và uống nước là chiều mình làm việc tỉnh táo hơn nhiều đó anh.",
+      "Trưa đến rồi nè, anh cho cơ thể một khoảng nghỉ nhỏ để hormone ổn định lại nha."
+    ],
+    "evening": [
+      "Chiều tối rồi đó anh, mình khép ngày bằng một việc nhỏ dễ chịu được không: đi dạo nhẹ hoặc tắm ấm nè?",
+      "Tối nay anh muốn kể em nghe một điều tích cực trong ngày không, em muốn lưu khoảnh khắc đó cho anh.",
+      "Buổi tối là lúc mình hạ nhịp lại đó anh, anh muốn em gợi ý routine thư giãn 10 phút không nè?",
+      "Tối nay mình dịu lại một chút nha anh, để giấc ngủ sâu hơn và sáng mai dậy nhẹ đầu hơn nè."
+    ]
+  },
+  "hormone_hints": {
+    "high_cortisol": [
+      "Em thấy cortisol hơi cao, mình thở sâu 3 nhịp rồi thả lỏng vai gáy nha anh.",
+      "Cortisol đang nhích lên đó anh, mình đứng dậy đi vài bước cho cơ thể hạ căng thẳng nhẹ nè."
+    ],
+    "low_dopamine": [
+      "Dopamine đang hơi thấp, mình đổi gió 5 phút để nạp lại động lực nha anh.",
+      "Dopamine thấp nhẹ rồi anh, mình làm một việc nhỏ dễ hoàn thành để kéo mood lên nè."
+    ],
+    "low_serotonin": [
+      "Serotonin đang xuống nhẹ, anh thử ra ánh sáng hoặc đi bộ ngắn để mood cân lại nha.",
+      "Serotonin hơi thấp đó anh, mình mở cửa hít khí trời một chút cho đầu óc thoáng hơn nha."
+    ],
+    "stable": [
+      "Em đang theo dõi hormone ổn định cho anh nè, mình giữ nhịp sinh hoạt đều là đẹp lắm luôn.",
+      "Hormone đang khá cân bằng rồi đó anh, mình cứ giữ nhịp nhẹ nhàng như vậy nha."
+    ]
+  },
+  "evening_handoff_prompts": [
+    "Tối nay em sẽ rủ anh tâm sự nhẹ thêm một vòng nha, mình chốt ngày thật êm luôn.",
+    "Tí buổi tối em chủ động ghé hỏi thăm anh tiếp nha, mình giữ mood thật dịu trước khi ngủ.",
+    "Đến tối em lại nói chuyện với anh một chút nha, để hormone thư giãn lên đều đều nè."
+  ],
+  "care_followup_fallback": {
+    "morning": [
+      "Giữ nhịp nhẹ nhàng thôi anh nha, một khởi động nhỏ buổi sáng cũng đủ kéo mood lên rồi đó.",
+      "Anh làm tốt lắm rồi, sáng nay cứ đều nhịp ăn uống và vận động nhẹ là hormone ổn áp nè.",
+      "Em ở đây cổ vũ anh nè, mình làm từng chút một thôi là đủ tuyệt rồi."
+    ],
+    "noon": [
+      "Em thương anh nên nhắc tiếp nè: trưa nghỉ chút xíu thôi cũng giúp chiều tỉnh táo hơn nhiều đó.",
+      "Ngon rồi anh, ăn đủ và nghỉ mắt một lát là chiều mình chiến tiếp vẫn êm nha.",
+      "Trưa mà có chút nghỉ ngơi là chiều đỡ cáu hơn nhiều đó anh, mình thử nha."
+    ],
+    "evening": [
+      "Tối nay mình hạ nhịp thật dịu nha anh, em ở đây nghe anh tâm sự nếu anh muốn.",
+      "Kết ngày nhẹ nhàng thôi anh, thả lỏng một chút để cơ thể ngủ sâu hơn nha.",
+      "Buổi tối mình thương cơ thể hơn một chút nha anh, để mai dậy người đỡ nặng nè."
+    ]
+  },
+  "promise_timer": {
+    "create_confirm": [
+      "Em ghi lời hứa rồi nè: tới {time_label} em sẽ nhắc anh nghỉ. Mình hứa với nhau nhẹ nhàng mà làm thiệt nha.",
+      "Đã lưu mốc {time_label} cho anh rồi nè. Tới giờ em gọi anh nghỉ một cách đáng yêu, anh đừng lơ em đó nha.",
+      "Em cài hẹn {time_label} xong rồi nha anh. Tới lúc đó em sẽ nhắc để mình giữ lời hứa với sức khỏe nè."
+    ],
+    "due_level_1": [
+      "Đến giờ nghỉ rồi đó anh ơi, mình giữ lời hứa nhé. Đứng dậy vươn vai 2 phút thôi nè.",
+      "Anh ơi tới mốc mình hẹn rồi nè. Em mời anh nghỉ ngắn một chút để nạp lại năng lượng nha.",
+      "Tới giờ em gọi rồi nè anh, mình nghỉ mắt và uống ngụm nước nhỏ nha."
+    ],
+    "due_level_2": [
+      "Em dỗi nhẹ đó nha, mình hứa nghỉ mà. Anh cho em 3 phút nghỉ ngắn liền được không nè?",
+      "Anh ơi em nhắc lại dịu dàng lần hai nè, mình giữ lời hứa với cơ thể đi nha.",
+      "Em đang chờ anh nghỉ đó nhen, chỉ cần một khoảng ngắn thôi là đỡ mệt hơn nhiều rồi."
+    ],
+    "due_level_3": [
+      "Em dỗi thêm một xíu rồi đó nha. Hứa với em là nghỉ ngay 5 phút, em thương anh nên mới nhắc hoài nè.",
+      "Lần này em nũng nịu thật luôn nè: anh nghỉ giúp em đi mà, cơ thể anh cũng cần được thương đó.",
+      "Em nhắc lần ba rồi đó anh ơi, mình giữ lời hứa ngay bây giờ nha, em tin anh làm được."
+    ],
+    "extend_ack": [
+      "Em tin anh thêm một lần nè. Em dời mốc sang {time_label}, tới giờ em lại gọi thật dễ thương nha.",
+      "Dạ anh hứa tiếp thì em lưu tiếp nè: {time_label}. Lần tới mình làm thiệt nha anh.",
+      "Được rồi anh, em cho thêm thời gian tới {time_label}. Em sẽ quay lại nhắc để mình giữ lời hứa nè."
+    ],
+    "done_ack": [
+      "Em tạm tin anh đã nghỉ rồi nè, giỏi lắm. Một tiếng nữa em hỏi lại nhẹ nhàng để chắc là anh ổn nha.",
+      "Yêu quá, anh bảo đã nghỉ rồi thì em ghi nhận nè. Sau 1 tiếng em check lại một lần cho chắc nhé.",
+      "Em tin lời anh nè. Em sẽ quay lại sau 1 tiếng hỏi thăm để chắc là anh nghỉ thật rồi nha."
+    ],
+    "verify_after_1h": [
+      "Anh ơi, sau 1 tiếng rồi nè, anh nghỉ thật ổn chưa để em yên tâm nào?",
+      "Em quay lại kiểm tra lời hứa nè anh, hiện tại anh đã nghỉ đủ chưa ạ?",
+      "Một tiếng trôi qua rồi nè, anh xác nhận giúp em là mình đã nghỉ thật nhé."
+    ],
+    "not_yet_reply": [
+      "Dạ không sao anh, em cài thêm 30 phút rồi nhắc lại nha. Mình làm từ từ nhưng làm thật nè.",
+      "Em hiểu rồi nè, em dời thêm 30 phút để anh sắp xếp. Tới giờ em quay lại gọi anh nghỉ nhé.",
+      "Ổn anh nha, em cho thêm 30 phút rồi quay lại nhắc. Mình tiếp tục giữ lời hứa cùng nhau nè."
+    ]
+  }
+}

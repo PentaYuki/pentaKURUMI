@@ -1,5 +1,7 @@
 from typing import Optional, List, Dict, Any, Union
 import os
+import json
+import random
 
 """
 PentaAI — Controller trung tâm.
@@ -30,6 +32,7 @@ except ImportError:
     logging.warning("⚠️ Không tìm thấy penta_memory.py, AI sẽ không có trí nhớ LLM.")
     llm_memory = None
 # -------------------------------------------
+
 
 class PentaAI:
     def __init__(self):
@@ -91,6 +94,27 @@ class PentaAI:
             except Exception:
                 pass
 
+        # Interpreter để làm "bộ não" Cloud
+        from ollama_command import get_default_interpreter
+        self.interpreter = get_default_interpreter()
+        self.enable_chat_llm_fallback = self._load_chat_llm_flag()
+
+    def _load_chat_llm_flag(self) -> bool:
+        """Đọc cờ bật LLM fallback cho mode chat từ config/env."""
+        env = os.getenv("PENTA_CHAT_USE_LLM_FALLBACK")
+        if env is not None:
+            return str(env).strip().lower() in {"1", "true", "yes", "on", "y"}
+
+        cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+        try:
+            if os.path.exists(cfg_path):
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                return bool(cfg.get("chat_use_llm_fallback", False))
+        except Exception:
+            pass
+        return False
+
     # ── PUBLIC ────────────────────────────────────────────────────
 
     def chat(self, user_input: str) -> str:
@@ -99,6 +123,20 @@ class PentaAI:
         parsed = self.parser.parse(user_input)
         intent = self.detector.detect(parsed)
         self.context.push("user", parsed.clean, parsed.language)
+
+        # Kiểm tra xác nhận đổi xưng hô nếu đang ở trạng thái pending
+        if self.profile.pronoun_pending and any(yes in parsed.clean.lower() for yes in ["được", "ok", "đồng ý", "uh", "um", "yes", "có thể"]):
+            pending = self.profile.pronoun_pending
+            self.profile.set_pronoun_pair(pending[0], pending[1])
+            self.profile.set_pronoun_pending(None) # Xóa pending
+            confirm_msg = f"Dạ, từ giờ em sẽ gọi {pending[0]} là {pending[0]} nhé! <3"
+            self.context.push("ai", confirm_msg, parsed.language)
+            return confirm_msg
+        elif self.profile.pronoun_pending:
+            self.profile.set_pronoun_pending(None) # Nếu không đồng ý thì xóa pending luôn
+            reject_msg = f"Dạ, vậy em vẫn giữ nguyên cách gọi là {self.profile.pronoun} như cũ nhé!"
+            self.context.push("ai", reject_msg, parsed.language)
+            return reject_msg
 
         # Kiểm tra nhắc nhở đến hạn
         due = self.time.check_due_reminders()
@@ -125,6 +163,16 @@ class PentaAI:
                 h_modifiers = self.emotion.before_response(
                     parsed.clean, intent.type, parsed.language
                 )
+                
+                # 1. Kiểm tra nếu AI đang "dỗi" (làm việc quá sức) -> Mở YouTube
+                if h_modifiers.get("emotional_state") == "upset_rest" or h_modifiers.get("spontaneous_text", "").find("giận") != -1:
+                    h_modifiers["spontaneous_text"] += " <URL>https://www.youtube.com/results?search_query=nỗi+buồn+của+cái+máy</URL>"
+                
+                # 2. Kiểm tra nếu người dùng hỏi lịch trình -> SHOW_SCHEDULE
+                sc_keywords = ["lịch", "thời biểu", "lịch trình", "schedule", "công việc trong tuần"]
+                is_asking_schedule = any(k in parsed.clean.lower() for k in sc_keywords)
+                if is_asking_schedule:
+                    h_modifiers["spontaneous_text"] += " <URL>SHOW_SCHEDULE</URL>"
             except Exception:
                 pass
 
@@ -147,7 +195,41 @@ class PentaAI:
                 pass
 
         # Personalize response nếu có tên người dùng
-        response = self.profile.personalize(response)
+        intimacy = h_modifiers.get("intimacy", 0.5)
+        distance = h_modifiers.get("distance", 0.0)
+
+        # Kiểm tra nếu AI muốn đổi xưng hô sang thân mật hơn (chỉ áp dụng tiếng Việt)
+        asking_text = ""
+        if (
+            parsed.language == "vi"
+            and (not self.profile.lock_pronoun)
+            and (not self.profile.pronoun_permission_asked)
+            and intimacy > 0.85
+        ):
+            current_user = self.profile.pronoun
+            dyn_user, dyn_ai = self.profile.get_dynamic_pronouns(intimacy, distance)
+            
+            if dyn_user != current_user and current_user == "bạn":
+                if dyn_user == "anh":
+                    asking_text = f" (À... em cảm thấy mình khá thân thiết rồi, em gọi {dyn_user} là {dyn_user} nhé?)"
+                elif dyn_user == "tớ":
+                    asking_text = f" (Nè, tớ gọi cậu là {dyn_user} cho thân thiết hơn được không?)"
+                
+                if asking_text:
+                    self.profile.set_pronoun_permission_asked(True)
+                    self.profile.set_pronoun_pending([dyn_user, dyn_ai])
+
+        # Thực hiện xưng phát
+        user_call = self.profile.user_call
+        response = self.profile.personalize(response, intimacy, distance)
+        # Thay thế PRONOUN bằng user_call linh hoạt
+        response = response.replace(self.profile.pronoun, user_call)
+        
+        # Gắn thêm câu bộc lộ cảm xúc chủ động (Proactive Text)
+        spon = h_modifiers.get("spontaneous_text", "")
+        if spon:
+            response = f"{response} {spon}"
+
         self.context.push("ai", response, parsed.language)
         return response
 
@@ -212,7 +294,7 @@ class PentaAI:
     # ── HANDLERS ─────────────────────────────────────────────────
 
     def _handle_time(self, text: str, lang: str) -> Optional[str]:
-        user_name = self.profile.name or self.profile.pronoun
+        user_name = self.profile.user_call or self.profile.name or self.profile.pronoun
         t_lower = text.lower()
         _remind_kw = ['nhắc ', 'nhắc anh', 'nhắc em', 'nhắc mình', 'nhắc tôi',
                       'remind me', 'remind us', 'reminder', 'リマインド',
@@ -229,9 +311,21 @@ class PentaAI:
                 msg      = reminder.get('message', '')
                 repeat   = reminder.get('repeat', False)
                 if lang == 'vi':
-                    ack = (f"Được rồi! {'Mỗi tuần mình' if repeat else 'Mình'} "
-                           f"sẽ nhắc {user_name} '{msg}'"
-                           f"{' lúc ' + time_str if time_str else ''} nhé.")
+                    when_text = f" lúc {time_str}" if time_str else ""
+                    if repeat:
+                        pool = [
+                            f"Dạ nhớ liền nè, mỗi tuần em sẽ nhắc {user_name} '{msg}'{when_text} nha.",
+                            f"Oke {user_name} ơi, tuần nào em cũng nhắc vụ '{msg}'{when_text} luôn cho khỏi quên.",
+                            f"Em note lại rồi nè, cứ tới lịch là em réo {user_name} '{msg}'{when_text} ngay.",
+                        ]
+                    else:
+                        pool = [
+                            f"Dạa, em sẽ nhắc {user_name} '{msg}'{when_text} nè.",
+                            f"Okay {user_name} ơi, tới giờ em réo '{msg}' liền cho mình nha.",
+                            f"Đã ghi nhớ rồi nè, em sẽ nhắc {user_name} vụ '{msg}'{when_text} cho chắc luôn.",
+                            f"Hehe yên tâm, em canh giờ nhắc {user_name} '{msg}'{when_text} nhé.",
+                        ]
+                    ack = random.choice(pool)
                 elif lang == 'en':
                     ack = (f"Got it! {'Every week I' if repeat else 'I'}'ll "
                            f"remind you to '{msg}'"
@@ -350,15 +444,84 @@ class PentaAI:
         if emotional:
             return emotional
 
+        # Bước 5.5: Context recall theo từ khóa (nhắc lại chuyện cũ)
+        recall_resp = self._try_context_recall(text, lang)
+        if recall_resp:
+            return self.builder.apply_hormone_tone(recall_resp, h_modifiers)
+
         # Bước 6: Phrase match mờ — CHỈ KHI SBERT (tfidf = tắt)
         if match and match.score >= THRESHOLD_LOW:
             self.store.increment_use(match.trigger)
             resp = self.builder.build_phrase_response(match, match.slots, lang)
             return self.builder.apply_hormone_tone(resp, h_modifiers)
 
-        # =========================================================
+        # Step 7: LLM Fallback (Cloud Brain) — mặc định tắt cho chat mode
+        if self.enable_chat_llm_fallback and self.interpreter:
+            h_vals = self.emotion.hormone.get() if self.emotion else {}
+            em_state = self.emotion.hormone.get_emotional_state() if self.emotion else "normal"
+            personality = self.emotion.personality if self.emotion else "curious"
+            
+            return self.interpreter.generate_response(
+                text=text,
+                lang=lang,
+                emotion_state=em_state,
+                personality=personality,
+                hormones=h_vals,
+                user_pronoun=self.profile.user_call,
+                ai_pronoun=self.profile.ai_pronoun,
+            )
+
         # Bước 8: Thà nói không biết còn hơn bịa
         return self.builder.build_unknown(lang)
+
+    def _try_context_recall(self, text: str, lang: str) -> Optional[str]:
+        """Nhận diện yêu cầu nhắc lại chuyện cũ và trả lời theo context map."""
+        t = text.lower().strip()
+        recall_markers_vi = [
+            "nhắc lại", "nhắc mình", "nhớ", "hồi nãy", "lúc nãy", "vừa nói", "truyện cũ", "chuyện cũ"
+        ]
+        recall_markers_en = ["recall", "remember", "earlier", "what did we talk", "previous"]
+
+        if lang == "vi":
+            is_recall = any(k in t for k in recall_markers_vi)
+        elif lang == "en":
+            is_recall = any(k in t for k in recall_markers_en)
+        else:
+            is_recall = any(k in t for k in recall_markers_vi)
+
+        if not is_recall:
+            return None
+
+        keywords = self.context.extract_keywords(text)
+        generic_vi = {
+            "nhac", "nhắc", "nho", "nhớ", "lai", "lại", "chuyen", "chuyện",
+            "cu", "cũ", "hoi", "hồi", "nay", "này", "luc", "lúc", "giup", "giúp"
+            , "phan", "phần"
+        }
+        generic_en = {"recall", "remember", "earlier", "previous", "topic", "again"}
+        generic = generic_vi | generic_en
+        filtered = [k for k in keywords if k.lower() not in generic]
+
+        keyword = (filtered[0] if filtered else (self.context.get_topic() or ""))
+        if not keyword:
+            summary = self.context.summarize()
+            return f"Em nhớ sơ bộ nè: {summary}. Anh muốn em nhắc lại theo từ khóa nào cụ thể hơn không?"
+
+        recalled = self.context.recall_recent_summary(keyword, limit=4)
+        related = self.context.get_related_keywords(keyword, top_k=4)
+
+        if not recalled:
+            if related:
+                rel = ", ".join(related)
+                return f"Em chưa thấy đoạn nào rõ với từ '{keyword}', nhưng nó hay đi cùng: {rel}. Anh thử nhắc một từ đó nha."
+            return f"Em chưa lôi ra được đoạn cũ với từ '{keyword}'. Anh gợi thêm 1-2 từ để em map lại chuẩn hơn nha."
+
+        if lang == "en":
+            rel = ", ".join(related) if related else "none"
+            return f"I found related context for '{keyword}':\n{recalled}\nRelated keywords: {rel}."
+
+        rel_vi = f"\nTừ khóa liên quan em map được: {', '.join(related)}." if related else ""
+        return f"Em nhắc lại đoạn mình vừa nói về '{keyword}' nè:\n{recalled}{rel_vi}"
 
     # ── PATTERN LOGIC ─────────────────────────────────────────────
 

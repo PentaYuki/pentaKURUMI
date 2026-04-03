@@ -87,6 +87,7 @@ class SessionContext:
     def __init__(self):
         self._turns:   List[Turn] = []
         self._lang:    str = "vi"
+        self._keyword_links: Dict[str, Counter] = {}
 
     # ── PUBLIC ────────────────────────────────────────────────────
 
@@ -94,6 +95,7 @@ class SessionContext:
         """Thêm lượt nói mới."""
         self._lang = lang
         self._turns.append(Turn(role=role, text=text, lang=lang))
+        self._update_keyword_links(text)
         # Giữ tối đa MAX_TURNS * 2 entries (user + ai mỗi lượt)
         if len(self._turns) > MAX_TURNS * 2:
             self._turns = self._turns[-(MAX_TURNS * 2):]
@@ -206,9 +208,45 @@ class SessionContext:
         sentiment = self.get_sentiment_trend()
         return f"{n} lượt | chủ đề: {topic} | cảm xúc: {sentiment}"
 
+    def extract_keywords(self, text: str) -> List[str]:
+        """Public helper: tách keywords từ text theo cùng logic context."""
+        return self._extract_nouns(text)
+
+    def get_related_keywords(self, keyword: str, top_k: int = 5) -> List[str]:
+        """Lấy các từ khóa hay đi cùng keyword trong phiên hiện tại."""
+        key = keyword.lower().strip()
+        if not key or key not in self._keyword_links:
+            return []
+        return [w for w, _ in self._keyword_links[key].most_common(top_k)]
+
+    def recall_recent_by_keyword(self, keyword: str, limit: int = 3) -> List[Turn]:
+        """Lấy các lượt nói gần nhất có chứa keyword."""
+        key = keyword.lower().strip()
+        if not key:
+            return []
+        hits: List[Turn] = []
+        for turn in reversed(self._turns):
+            if key in turn.text.lower():
+                hits.append(turn)
+                if len(hits) >= limit:
+                    break
+        return list(reversed(hits))
+
+    def recall_recent_summary(self, keyword: str, limit: int = 3) -> str:
+        """Tóm tắt ngắn các câu gần đây có chứa keyword."""
+        turns = self.recall_recent_by_keyword(keyword, limit=limit)
+        if not turns:
+            return ""
+        lines = []
+        for t in turns:
+            who = "Anh" if t.role == "user" else "Em"
+            lines.append(f"- {who}: {t.text}")
+        return "\n".join(lines)
+
     def clear(self):
         """Reset phiên (khi bắt đầu cuộc trò chuyện mới)."""
         self._turns = []
+        self._keyword_links = {}
 
     # ── PRIVATE ───────────────────────────────────────────────────
 
@@ -240,3 +278,14 @@ class SessionContext:
                  and len(w) >= 2
                  and not w.isdigit()]
         return nouns
+
+    def _update_keyword_links(self, text: str):
+        """Xây map đồng xuất hiện keyword để truy hồi chủ đề tốt hơn."""
+        kws = list(dict.fromkeys(self._extract_nouns(text)))
+        if len(kws) < 2:
+            return
+        for key in kws:
+            counter = self._keyword_links.setdefault(key, Counter())
+            for other in kws:
+                if other != key:
+                    counter[other] += 1

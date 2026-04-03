@@ -272,6 +272,10 @@ class HormoneCore:
         positivity = max(0.0, min(1.0, S * 0.4 + D * 0.3 + OXT * 0.2 - CORT * 0.4))
         proactivity = max(0.0, min(1.0, D * 0.5 + OXT * 0.2 - CORT * 0.2))
 
+        # New modifiers for dynamic pronouns
+        intimacy = max(0.0, min(1.0, OXT * 0.7 + S * 0.3))
+        distance = max(0.0, min(1.0, CORT * 0.8 - OXT * 0.2))
+
         if positivity > 0.6:
             choice_bias = "positive"
         elif positivity < 0.4 or CORT > 0.5:
@@ -303,6 +307,8 @@ class HormoneCore:
             "verbosity":           round(verbosity, 3),
             "positivity":          round(positivity, 3),
             "proactivity":         round(proactivity, 3),
+            "intimacy":            round(intimacy, 3),
+            "distance":            round(distance, 3),
             "choice_bias":         choice_bias,
             "yes_bias":            round(yes_bias, 3),
             "willingness":         round(willingness, 3),

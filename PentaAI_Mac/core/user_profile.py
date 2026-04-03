@@ -25,10 +25,13 @@ _DEFAULT_PROFILE = {
     "ai_name":    None,   # Người dùng chưa đặt tên cho AI
     "pronoun":    "bạn",  # Default gọi người dùng là "bạn"
     "ai_pronoun": "mình", # AI tự xưng là "mình"
+    "lock_pronoun": True,  # Khóa theo cặp xưng hô ban đầu
     "lang":       "vi",
     "created_at": None,
     "last_seen":  None,
     "session_count": 0,
+    "pronoun_permission_asked": False,
+    "pronoun_pending": None,
 }
 
 # Cách xưng hô theo cặp (người dùng → AI)
@@ -74,8 +77,24 @@ class UserProfile:
         return self._data.get("pronoun", "bạn")
 
     @property
+    def user_call(self) -> str:
+        return self._data.get("user_call") or self.pronoun
+
+    def set_user_call(self, call: str):
+        self._data["user_call"] = call.strip()
+        self._save()
+
+    @property
     def ai_pronoun(self) -> str:
         return self._data.get("ai_pronoun", "mình")
+
+    @property
+    def lock_pronoun(self) -> bool:
+        return bool(self._data.get("lock_pronoun", True))
+
+    def set_lock_pronoun(self, locked: bool = True):
+        self._data["lock_pronoun"] = bool(locked)
+        self._save()
 
     @property
     def lang(self) -> str:
@@ -89,6 +108,22 @@ class UserProfile:
     @property
     def session_count(self) -> int:
         return self._data.get("session_count", 0)
+
+    @property
+    def pronoun_permission_asked(self) -> bool:
+        return self._data.get("pronoun_permission_asked", False)
+
+    def set_pronoun_permission_asked(self, asked: bool = True):
+        self._data["pronoun_permission_asked"] = asked
+        self._save()
+
+    @property
+    def pronoun_pending(self) -> Optional[list]:
+        return self._data.get("pronoun_pending")
+
+    def set_pronoun_pending(self, pair: Optional[list]):
+        self._data["pronoun_pending"] = pair
+        self._save()
 
     def set_name(self, name: str):
         """Lưu tên người dùng."""
@@ -157,25 +192,52 @@ class UserProfile:
             "is_new":     sessions <= 1,
         }
 
-    def personalize(self, text: str) -> str:
+    def get_dynamic_pronouns(self, intimacy: float, distance: float) -> tuple:
+        """
+        Dựa trên intimacy/distance, đề xuất cặp xưng hô phù hợp.
+        """
+        current_user = self.pronoun
+        current_ai   = self.ai_pronoun
+
+        # 1. Nếu quá lạnh lùng (distance cao) -> dùng tôi/bạn
+        if distance > 0.7:
+            if self.lang == "vi":
+                return "bạn", "tôi"
+            return current_user, current_ai
+        
+        # 2. Nếu thân mật (intimacy cao) -> đề xuất đổi nếu đang là bạn/mình
+        if intimacy > 0.8:
+            if self.lang == "vi" and current_user == "bạn":
+                if self.name and ("anh" in self.name.lower()):
+                    return "anh", "em"
+                if self.name and ("chị" in self.name.lower()):
+                    return "chị", "em"
+                return "tớ", "cậu"
+        
+        return current_user, current_ai
+
+    def personalize(self, text: str, intimacy: float = 0.5, distance: float = 0.0) -> str:
         """
         Thay thế placeholder trong text bằng tên thật.
-
-        {USER}     → tên người dùng ("Minh")
-        {AI}       → tên AI ("Penta")
-        {PRONOUN}  → cách gọi người dùng ("anh", "bạn")
-        {AI_PRN}   → AI tự xưng ("em", "mình")
+        Hỗ trợ xưng hô năng động dựa trên intimacy/distance.
         """
-        name          = self.name or self.pronoun
+        name          = self.name
         ai_name       = self.ai_name or "Penta"
-        pronoun       = self.pronoun
-        ai_pronoun    = self.ai_pronoun
+        
+        # Nếu lock_pronoun=True thì giữ cặp xưng hô ban đầu.
+        if self.lock_pronoun:
+            dyn_user, dyn_ai = self.pronoun, self.ai_pronoun
+        else:
+            dyn_user, dyn_ai = self.get_dynamic_pronouns(intimacy, distance)
+        
+        # Fallback name nếu chưa có
+        display_name = name or self.user_call
 
         return (text
-                .replace("{USER}",    name)
+                .replace("{USER}",    display_name)
                 .replace("{AI}",      ai_name)
-                .replace("{PRONOUN}", pronoun)
-                .replace("{AI_PRN}",  ai_pronoun))
+                .replace("{PRONOUN}", self.user_call)
+                .replace("{AI_PRN}",  dyn_ai))
 
     # ── PRIVATE ───────────────────────────────────────────────────
 

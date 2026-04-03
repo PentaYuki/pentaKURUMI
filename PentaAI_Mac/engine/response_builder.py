@@ -158,13 +158,13 @@ class ResponseBuilder:
         # ── UNKNOWN RESPONSE POOLS (cải thiện + context-aware) ────
         self._unknown_pools: Dict[str, List[str]] = {
             "vi": [
-                "Hmm, mình chưa biết câu này. Bạn dạy mình được không?",
-                "Ừ... mình chưa học cái này. Bạn có thể giải thích không?",
-                "Mình chưa hiểu ý bạn. Bạn dạy mình nhé?",
-                "Câu này mình chưa biết trả lời. Bạn hướng dẫn mình đi!",
-                "Ủa, mình chưa có câu trả lời cho cái này. Bạn dạy mình đi nhé?",
-                "Ồ! Câu này hay đó, mình chưa học. Bạn dạy mình trả lời sao nhé?",
-                "Mình không chắc mình hiểu đúng không. Bạn nói rõ hơn được không?",
+                "Ui, câu này em chưa học kỹ. Anh nói rõ thêm chút cho em với nha?",
+                "Huhu em chưa hiểu trọn ý này, anh diễn đạt lại giúp em một xíu được không?",
+                "Câu này mới với em quá, anh dạy em cách trả lời cho chuẩn nha.",
+                "Em hơi ngơ đoạn này rồi, anh nói chậm hơn một chút cho em được không?",
+                "Em muốn trả lời cho đúng ý anh, anh gợi ý thêm giúp em nha.",
+                "Câu này em chưa chắc lắm, mình thử nói lại theo cách khác nè?",
+                "Cho em xin thêm tí ngữ cảnh nha, em sẽ trả lời mượt hơn liền.",
             ],
             "en": [
                 "Hmm, I haven't learned this yet. Could you teach me?",
@@ -186,7 +186,7 @@ class ResponseBuilder:
         self._clarify_pools: Dict[str, List[str]] = {
             "vi": [
                 "Bạn đang hỏi về '{topic}' hay điều gì khác?",
-                "Hmm, mình không chắc mình hiểu đúng. Bạn có thể nói rõ hơn không?",
+                "Em chưa chắc em hiểu đúng ý, anh nói rõ thêm cho em nhé?",
                 "Ý bạn là '{topic}' hay gì khác vậy?",
                 "Mình hơi mơ hồ về câu này. Bạn giải thích thêm được không?",
                 "Mình chưa chắc câu trả lời đúng. Bạn dạy mình nhé?",

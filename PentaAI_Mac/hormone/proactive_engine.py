@@ -100,6 +100,11 @@ _TEMPLATES: Dict[str, Dict[str, list]] = {
             "(Thật sao, em chưa nghĩ đến điều đó!)",
             "",
         ],
+        "upset_rest": [
+            "(Em giận rồi đó nhen! Anh làm việc lâu quá rồi, nghỉ ngơi đi mà...)",
+            "(Anh không chịu nghe lời em gì cả, em khóc cho anh xem! 😭)",
+            "(Nghỉ một chút đi anh, em lo cho sức khỏe của anh lắm đó.)",
+        ],
     },
     "en": {
         "excited_warm": [
@@ -188,6 +193,7 @@ _COOLDOWN_BY_STATE: Dict[str, float] = {
     "tired":            15,   # Mệt → ít nói hơn
     "stressed":         12,
     "anxious":          10,
+    "upset_rest":        5,
     "default":           7,
 }
 
@@ -204,6 +210,8 @@ class ProactiveEngine:
         self._last_proactive_time   = 0.0
         self._interaction_count     = 0
         self._min_before_proactive  = min_interactions_before_proactive
+        self._session_start_time    = time.time()
+        self._rest_suggested        = False
 
         logger.info("ProactiveEngine ready (min_interactions=%d)", min_interactions_before_proactive)
 
@@ -238,8 +246,14 @@ class ProactiveEngine:
         if elapsed < cooldown:
             return ""
 
-        # Tìm state phù hợp với hormone hiện tại
-        matched_state = self._match_state(hormone_levels, emotional_state)
+        # Kiểm tra đặc biệt cho trạng thái làm việc quá sức (2 tiếng)
+        work_duration = time.time() - self._session_start_time
+        if work_duration > 7200: # 2 tiếng
+            matched_state = "upset_rest"
+        else:
+            # Tìm state phù hợp với hormone hiện tại
+            matched_state = self._match_state(hormone_levels, emotional_state)
+
         if not matched_state:
             return ""
 
@@ -279,9 +293,10 @@ class ProactiveEngine:
 
         questions = {
             "vi": [
-                "Mình thấy ổn chứ?",
-                "Hôm nay có gì vui không?",
-                "Anh/chị đang làm gì vậy?",
+                "Anh ơi, nãy giờ anh thấy trong người thế nào rồi ạ?",
+                "Hôm nay của anh có gì vui kể em nghe với nhen!",
+                "Anh đang làm gì đó? Có mệt không anh?",
+                "Anh có muốn em xem giúp lịch trình hôm nay không nè?",
                 "",
             ],
             "en": [

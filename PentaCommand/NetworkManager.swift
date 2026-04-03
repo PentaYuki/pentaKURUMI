@@ -104,6 +104,7 @@ class Penta​NetworkManager: NSObject, ObservableObject, AVAudioPlayerDelegate 
     private var pingTimer: Timer?
     private var audioPlayer  : AVAudioPlayer?
     private var micBlockUntil: Date = .distantPast
+    private var compressedAudioQueue: [Data] = []
 
     override init() {
         super.init()
@@ -118,14 +119,37 @@ class Penta​NetworkManager: NSObject, ObservableObject, AVAudioPlayerDelegate 
 
     // MARK: - URLs
 
+    private func loadAIServerPool() -> [String] {
+        let defaults = UserDefaults.standard
+        let stored = defaults.array(forKey: "ai_server_pool") as? [String] ?? []
+        let trimmed = stored
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        if !trimmed.isEmpty {
+            return Array(NSOrderedSet(array: trimmed)) as? [String] ?? trimmed
+        }
+        let legacy = defaults.string(forKey: "windows_ai_url") ?? "http://100.x.x.x:9090"
+        return [legacy]
+    }
+
     private var windowsAIURL: String {
-        UserDefaults.standard.string(forKey: "windows_ai_url") ?? "http://100.x.x.x:9090"
+        let defaults = UserDefaults.standard
+        let active = defaults.string(forKey: "active_ai_server_url")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !active.isEmpty {
+            return active
+        }
+        return loadAIServerPool().first ?? "http://100.x.x.x:9090"
     }
     private var wsURL: String {
-        windowsAIURL
+        var url = windowsAIURL
             .replacingOccurrences(of: "https://", with: "wss://")
             .replacingOccurrences(of: "http://",  with: "ws://")
             + "/ws/chat"
+        // ── WebSocket Security: thêm token vào query param ──────────────────
+        if !authToken.isEmpty {
+            url += "?token=\(authToken)"
+        }
+        return url
     }
     private var macMiniURL: String {
         UserDefaults.standard.string(forKey: "tailscale_url") ?? "http://100.x.x.x:8080"
@@ -322,6 +346,7 @@ class Penta​NetworkManager: NSObject, ObservableObject, AVAudioPlayerDelegate 
 
     func sendChatWS(
         text:    String,
+        mode:    String = "chat",
         onText:  @escaping (String, Int) -> Void,
         onError: @escaping (String)      -> Void
     ) {
@@ -333,6 +358,9 @@ class Penta​NetworkManager: NSObject, ObservableObject, AVAudioPlayerDelegate 
 
         let payload: [String: Any] = [
             "text":    text,
+            "mode":    mode,
+            "tts":     true,
+            "token":   authToken,
             "speaker": preferredSpeaker,
             "speed":   1.0
         ]
@@ -379,13 +407,18 @@ class Penta​NetworkManager: NSObject, ObservableObject, AVAudioPlayerDelegate 
                     let type = obj["type"] as? String ?? ""
 
                     switch type {
-                    case "text":
+                    case "response", "text":
                         let txt = obj["text"] as? String ?? ""
                         let ms  = obj["ai_latency_ms"] as? Int ?? 0
                         DispatchQueue.main.async {
                             self.lastResponseText = txt
                             self.lastLatencyMs    = ms
                             onText(txt, ms)
+                        }
+                        self.receiveLoop(generation: generation, onText: onText, onError: onError)
+
+                    case "tts_start":
+                        DispatchQueue.main.async {
                             self.onAudioWillPlay?()
                         }
                         self.receiveLoop(generation: generation, onText: onText, onError: onError)
@@ -393,7 +426,12 @@ class Penta​NetworkManager: NSObject, ObservableObject, AVAudioPlayerDelegate 
                     case "audio_chunk":
                         if let b64 = obj["audio_b64"] as? String,
                            let audioData = Data(base64Encoded: b64) {
-                            self.scheduleWAVChunk(audioData)
+                            let mimeType = (obj["mime_type"] as? String ?? "audio/wav").lowercased()
+                            if mimeType.contains("mpeg") || mimeType.contains("mp3") {
+                                self.enqueueCompressedAudio(audioData)
+                            } else {
+                                self.scheduleWAVChunk(audioData)
+                            }
                         }
                         self.receiveLoop(generation: generation, onText: onText, onError: onError)
 
@@ -594,6 +632,53 @@ class Penta​NetworkManager: NSObject, ObservableObject, AVAudioPlayerDelegate 
 
     func stopAudio() {
         audioQueue.async { [weak self] in self?.teardownAudioEngine_internal() }
+        DispatchQueue.main.async {
+            self.audioPlayer?.stop()
+            self.audioPlayer = nil
+            self.compressedAudioQueue.removeAll()
+            self.isPlayingAudio = false
+        }
+    }
+
+    // MARK: - Compressed Audio Queue
+
+    private func enqueueCompressedAudio(_ data: Data) {
+        DispatchQueue.main.async {
+            self.compressedAudioQueue.append(data)
+            if self.audioPlayer == nil || self.audioPlayer?.isPlaying == false {
+                self.playNextCompressedAudio()
+            }
+        }
+    }
+
+    private func playNextCompressedAudio() {
+        guard !compressedAudioQueue.isEmpty else {
+            audioPlayer = nil
+            isPlayingAudio = false
+            restoreRecordSession()
+            micBlockUntil = Date().addingTimeInterval(0.8)
+            onAudioDidEnd?()
+            return
+        }
+
+        let data = compressedAudioQueue.removeFirst()
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try? session.setActive(true)
+            let player = try AVAudioPlayer(data: data)
+            player.delegate = self
+            player.volume = 1.0
+            player.prepareToPlay()
+            audioPlayer = player
+            let ok = player.play()
+            isPlayingAudio = ok
+            if !ok {
+                playNextCompressedAudio()
+            }
+        } catch {
+            print("⚠️ Compressed audio play error: \(error)")
+            playNextCompressedAudio()
+        }
     }
 
     // MARK: - HTTP sendChat (giữ nguyên)
@@ -830,6 +915,11 @@ class Penta​NetworkManager: NSObject, ObservableObject, AVAudioPlayerDelegate 
 
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
         DispatchQueue.main.async {
+            if !self.compressedAudioQueue.isEmpty {
+                self.playNextCompressedAudio()
+                return
+            }
+            self.audioPlayer = nil
             self.isPlayingAudio = false
             self.restoreRecordSession()
             self.micBlockUntil = Date().addingTimeInterval(0.8)
@@ -838,6 +928,12 @@ class Penta​NetworkManager: NSObject, ObservableObject, AVAudioPlayerDelegate 
     }
     func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
         DispatchQueue.main.async {
+            print("⚠️ Audio decode error: \(error?.localizedDescription ?? "unknown")")
+            if !self.compressedAudioQueue.isEmpty {
+                self.playNextCompressedAudio()
+                return
+            }
+            self.audioPlayer = nil
             self.isPlayingAudio = false
             self.restoreRecordSession()
             self.micBlockUntil = Date().addingTimeInterval(0.8)
