@@ -1,11 +1,25 @@
 # 🔺 pentaKURUMI — Unified AI Ecosystem
 
-![Version](https://img.shields.io/badge/version-5.6-blue)
+![Version](https://img.shields.io/badge/version-5.7-blue)
 ![Language](https://img.shields.io/badge/language-Python%20%7C%20Swift%20%7C%20C++-orange)
 ![AI](https://img.shields.io/badge/ai-Ollama%20%7C%20Cloud%20LLM-green)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20iOS%20%7C%20Windows-lightgrey)
 
 **pentaKURUMI** là một hệ sinh thái AI toàn diện, kết hợp máy chủ trí tuệ nhân đạo (chạy trên Mac Mini) với ứng dụng điều khiển giọng nói (iOS) và launcher thông minh (Windows). Điểm đặc biệt của hệ thống là **Hormone System v2.0** — mô phỏng cảm xúc sinh học giúp AI có cảm xúc, tính cách và trực giác gần như con người.
+
+---
+
+## 🧭 Điều hướng nhanh
+
+- [Tổng quan](#-tổng-quan)
+- [Nâng cấp mới (04/2026)](#-nâng-cấp-mới-042026)
+- [Demo nhanh 3 phút](#-demo-nhanh-3-phút)
+- [Checklist nghiệm thu nhanh](#-checklist-nghiệm-thu-nhanh)
+- [Tính năng cốt lõi](#-tính-năng-cốt-lõi)
+- [Kiến trúc hệ thống](#️-kiến-trúc-hệ-thống)
+- [Cấu trúc dự án chi tiết](#-cấu-trúc-dự-án-chi-tiết)
+- [Hướng dẫn cài đặt và chạy](#-hướng-dẫn-cài-đặt-và-chạy)
+- [API Reference](#-api-reference)
 
 ---
 
@@ -18,6 +32,94 @@ Hệ sinh thái pentaKURUMI bao gồm 3 thành phần chính:
 | [**PentaAI_Mac**](#1-pentaaimac---mac-mini-ai-server) | macOS (Python/FastAPI) | Server AI trung tâm với Hormone Engine, TTS, NLP |
 | [**PentaCommand**](#2-pentacommand---ios-voice-controller) | iOS (Swift/SwiftUI) | Ứng dụng iPhone điều khiển bằng giọng nói qua WebSocket |
 | [**PentakuruV4**](#3-pentakuruv4---windows-radial-launcher--ai-agent) | Windows (Python/PySide6) | Radial Launcher + AI Agent ghi/phát demo và điều khiển PC từ xa |
+
+---
+
+## ✨ Nâng cấp mới (04/2026)
+
+### 1) Gmail Notification Flow (full stack)
+- Bật/tắt bằng voice: "bật pentagmail", "tắt pentagmail".
+- Daemon theo dõi email whitelist, xếp hàng queue và hỏi xác nhận trước khi đọc nội dung.
+- Nếu user chưa phản hồi: tự nhắc lại sau theo `gmail_notification_retry_interval_sec`.
+- Hỗ trợ API riêng: whitelist/queue/response/clear/enable.
+- Dữ liệu whitelist tách riêng tại `PentaAI_Mac/data/gmail_notify_whitelist.json`.
+
+### 2) TTS phát tuần tự, không chồng tiếng
+- Chat TTS và proactive TTS đã được serialize để phát lần lượt.
+- Tránh hiện tượng trả lời song song gây khó nghe trong luồng hội thoại dài.
+
+### 3) Cải tiến lấy nội dung email
+- Tăng độ ổn định khi đọc nội dung thật từ IMAP (ưu tiên `RFC822`, fallback hợp lệ).
+- Cải thiện decode sender/subject và fallback nội dung HTML -> text.
+
+### 4) Chuẩn hóa module theo hướng mở rộng
+- Tách nhóm API local vào `PentaAI_Mac/API_local/` (`ollama_command.py`, `penta_memory.py`, `pentami_chat.py`).
+- Bổ sung `PentaAI_Mac/skillmanager.py` + thư mục `PentaAI_Mac/skills/` cho kiến trúc plugin skill.
+- Thêm `PentaAI_Mac/services/gmail_notification_daemon.py` cho background service chuyên biệt.
+
+### 5) Help/CLI đầy đủ hơn
+- Mục hướng dẫn đã bổ sung rõ "Chế độ Lịch" và "Chế độ Dạy A -> B" với câu mẫu thực tế.
+
+### 6) Tài liệu mới
+- `GMAIL_NOTIFICATION_QUICKSTART.md`
+- `GMAIL_NOTIFICATION_GUIDE.md`
+- `GMAIL_NOTIFICATION_DEPLOYMENT.md`
+
+---
+
+## 🚀 Demo nhanh 3 phút
+
+### Bước 1: Chạy backend
+
+```bash
+cd PentaAI_Mac
+python ai_server.py
+```
+
+Kỳ vọng: server listen ở `http://0.0.0.0:9090` và có log `Proactive background task started`.
+
+### Bước 2: Kiểm tra health
+
+```bash
+curl -s http://127.0.0.1:9090/api/health | jq
+```
+
+Kỳ vọng:
+- `"status": "ok"`
+- `"ai_ready": true`
+
+### Bước 3: Test chat nhanh
+
+Gửi qua CLI/iOS client câu bất kỳ, ví dụ:
+- "xin chào"
+- "hôm nay thứ mấy"
+
+Kỳ vọng:
+- Có phản hồi text ngay
+- Nếu bật TTS: audio phát tuần tự, không chồng tiếng
+
+### Bước 4: Test Gmail Notification nhanh
+
+1. Bật tính năng: nói "bật pentagmail"
+2. Gửi 1 email mới từ địa chỉ nằm trong whitelist
+3. Khi AI hỏi đọc nội dung, trả lời "được"
+
+Kỳ vọng:
+- Có thông báo người gửi
+- AI đọc phần nội dung tóm tắt thay vì fallback rỗng
+
+---
+
+## ✅ Checklist nghiệm thu nhanh
+
+- [ ] API health OK: `/api/health`
+- [ ] WebSocket chat ổn định, không disconnect bất thường
+- [ ] TTS chat + proactive phát tuần tự, không overlap
+- [ ] Gmail whitelist lưu được qua API/CLI
+- [ ] Gmail email mới vào queue đúng sender whitelist
+- [ ] Trả lời "được/không" điều khiển được luồng đọc email
+- [ ] File whitelist tồn tại: `PentaAI_Mac/data/gmail_notify_whitelist.json`
+- [ ] Các docs Gmail mới đã có trong root
 
 ---
 
@@ -127,8 +229,14 @@ PentaAI_Mac/
 │
 ├── config.py                 # Cấu hình ứng dụng
 ├── cli.py                    # CLI cho PentaAI
-├── penta_memory.py           # 🧩 Bộ nhớ LLM (Redis + Faiss)
-├── ollama_command.py         # Ollama/Cloud LLM Interpreter
+├── API_local/                # Local API modules (Ollama, memory, PentaMi)
+│   ├── ollama_command.py
+│   ├── penta_memory.py
+│   └── pentami_chat.py
+├── services/
+│   └── gmail_notification_daemon.py # Gmail notification background daemon
+├── skillmanager.py           # Skill manager
+├── skills/                   # Skill modules (gmail, gmail_notification_intent, ...)
 │
 ├── core/                     # 🔤 Core NLP
 │   ├── input_parser.py       # Phân tích câu đầu vào (tokenize, detect language)
@@ -178,6 +286,9 @@ PentaAI_Mac/
 │       ├── voicevox_engine.py
 │       └── open_jtalk_dic_utf_8-1.11/ # Japanese dictionary
 │
+├── music/                    # Nhạc proactive
+├── tts_engine/
+│   └── tts_manager.py        # TTS router đa ngôn ngữ
 └── data/                     # 📁 Dữ liệu runtime (gitignored)
     ├── hormone_state.json    # Trạng thái hormone hiện tại
     ├── user_profile.json     # Hồ sơ người dùng
@@ -265,8 +376,8 @@ PentakuruV4/
 
 ```bash
 # Clone repository
-git clone https://github.com/gooleseswsq1/pentaKURUMI.git
-cd pentaKURUMI/PentaAI_Mac
+git clone https://github.com/PentaYuki/Pentamiv1.git
+cd Pentamiv1/PentaAI_Mac
 
 # Cài đặt dependencies cơ bản
 pip install fastapi uvicorn tinytuya requests edge-tts pydantic
@@ -338,7 +449,7 @@ python pentaKuruV4.py
 
 | Endpoint | Mô tả |
 |----------|-------|
-| `ws://host:9090/ws/chat` | Real-time chat với TTS streaming |
+| `ws://host:9090/ws/chat?token=<auth_token>` | Real-time chat với TTS streaming |
 
 **Request format:**
 ```json
@@ -347,7 +458,8 @@ python pentaKuruV4.py
   "mode": "chat",
   "tts": true,
   "speaker": "NF",
-  "speed": 1.0
+  "speed": 1.0,
+  "token": "your_secret_token"
 }
 ```
 
@@ -507,8 +619,8 @@ python ai_server.py
 Dự án được phát triển bởi **gooleseswsq1**. Mọi ý kiến đóng góp về hệ thống hormone, cải thiện giọng nói, hoặc tính năng mới đều được chào đón!
 
 ### Liên hệ
-- GitHub: [gooleseswsq1/pentaKURUMI](https://github.com/gooleseswsq1/pentaKURUMI)
-- Issues: [Report bugs & feature requests](https://github.com/gooleseswsq1/pentaKURUMI/issues)
+- GitHub: [PentaYuki/Pentamiv1](https://github.com/PentaYuki/Pentamiv1)
+- Issues: [Report bugs & feature requests](https://github.com/PentaYuki/Pentamiv1/issues)
 
 ---
 
