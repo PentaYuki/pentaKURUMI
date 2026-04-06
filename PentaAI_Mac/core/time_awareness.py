@@ -30,7 +30,7 @@ def _get_penta_memory():
     if _PENTA_MEMORY is not None:
         return _PENTA_MEMORY
     try:
-        from penta_memory import PentaMemory
+        from API_local.penta_memory import PentaMemory
         _PENTA_MEMORY = PentaMemory()
     except Exception as e:
         logger.debug("PentaMemory unavailable for reminder variation: %s", e)

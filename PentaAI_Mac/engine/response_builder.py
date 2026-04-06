@@ -414,9 +414,8 @@ class ResponseBuilder:
             if len(sentences) > 1:
                 result = sentences[0] + "."
 
-        spontaneous = h_modifiers.get("spontaneous_text", "")
-        if spontaneous and len(result) < 80:
-            result = result + " " + spontaneous
+        # NOTE: spontaneous_text được gắn vào response bởi main.py sau khi _route() trả về.
+        # Không gắn ở đây để tránh bị lặp đôi.
 
         return result.strip()
 

@@ -33,19 +33,40 @@ _PLATFORM_HINTS = {
     "youtube", "yt", "google", "gg", "bing", "wiki", "wikipedia", "github", "npm",
     "facebook", "fb", "instagram", "tiktok", "twitter", "reddit", "netflix",
     "spotify", "gmail", "discord", "zalo", "shopee", "lazada", "grab",
+    # Lỗi voice-to-text phổ biến (voice recognition typos)
+    "toutube", "youttube", "youtub", "u-tube", "utube", "yutube",
+    "yuotube", "youtobe", "yotube", "yourube",
+    "facbook", "facebok", "faceebook",
+    "gogle", "gooogle", "googel", "goole", "goolge",
+    "discrod", "discrd",
 }
 
 _SIMPLE_COMMAND_PREFIXES = (
     "mở", "tim", "tìm", "tim kiem", "tìm kiếm", "chay", "chạy", "phat", "phát",
-    "bat", "bật", "tat", "tắt", "open", "search", "find", "run", "play"
+    "bat", "bật", "tat", "tắt", "dong", "đóng", "close", "open", "search", "find", "run", "play"
 )
 
 # ── Rule-based direct lookup (không cần Ollama) ───────────────────────────────
 _DIRECT_OPEN_URLS: Dict[str, str] = {
     "youtube":   "https://www.youtube.com",
     "yt":        "https://www.youtube.com",
+    # Voice typos → youtube
+    "toutube":   "https://www.youtube.com",
+    "youttube":  "https://www.youtube.com",
+    "youtub":    "https://www.youtube.com",
+    "utube":     "https://www.youtube.com",
+    "yutube":    "https://www.youtube.com",
+    "youtobe":   "https://www.youtube.com",
+    "yotube":    "https://www.youtube.com",
+    "yourube":   "https://www.youtube.com",
     "google":    "https://www.google.com",
     "gg":        "https://www.google.com",
+    # Voice typos → google
+    "gogle":     "https://www.google.com",
+    "gooogle":   "https://www.google.com",
+    "googel":    "https://www.google.com",
+    "goole":     "https://www.google.com",
+    "goolge":    "https://www.google.com",
     "bing":      "https://www.bing.com",
     "wiki":      "https://vi.wikipedia.org",
     "wikipedia": "https://vi.wikipedia.org",
@@ -181,15 +202,21 @@ _RE_PLAY = re.compile(
     r'^(?:phát|phat|play|nghe)\s+(.+)$',
     re.IGNORECASE,
 )
+_RE_CLOSE_WINDOW = re.compile(
+    r'^(?:đóng|dong|tắt|tat|close)\s+(?:đúng\s+)?(?:cửa\s*sổ|cua\s*so|window)\s+(.+)$',
+    re.IGNORECASE,
+)
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 _SYS_PROMPT = (
     "You are a command parser for a Vietnamese AI assistant. "
     "Respond with ONLY a valid JSON object — no markdown, no explanation, no extra text. "
     "Never reveal reasoning, analysis, or chain-of-thought. "
+    "Silently fix Vietnamese speech-to-text mistakes, missing accents, platform/app typos, and spacing mistakes before deciding the command. "
+    "If a platform or app name is misspelled, infer the most likely intended canonical name. "
     "JSON schema: {\"action\": str, \"target\": str, \"query\": str}\n\n"
     "Field meanings:\n"
-    "  action : what to do  (open | search | play | run | fetch | setup | penta | ps_script)\n"
+    "  action : what to do  (open | search | play | run | fetch | setup | penta | ps_script | close_window)\n"
     "  target : main object (a URL, platform name, app name, system setting, or a short name for a script)\n"
     "  query  : search term / additional parameter / or full PowerShell code for ps_script\n\n"
     "Examples (Vietnamese commands):\n"
@@ -203,6 +230,7 @@ _SYS_PROMPT = (
     "  'mở notepad'               → {\"action\":\"run\",\"target\":\"Notepad\",\"query\":\"\"}\n"
     "  'lấy dữ liệu vnexpress'    → {\"action\":\"fetch\",\"target\":\"https://vnexpress.net\",\"query\":\"\"}\n"
     "  'tắt âm thanh'             → {\"action\":\"setup\",\"target\":\"volume\",\"query\":\"0\"}\n"
+    "  'đóng cửa sổ YouTube Music Premium' → {\"action\":\"close_window\",\"target\":\"window\",\"query\":\"YouTube Music Premium\"}\n"
     "  'chạy link penta số 2'     → {\"action\":\"penta\",\"target\":\"link\",\"query\":\"2\"}\n"
     "  'viết script dọn rác pc'   → {\"action\":\"ps_script\",\"target\":\"Cleanup\",\"query\":\"Remove-Item -Path $env:TEMP\\* -Recurse -Force\"}\n\n"
     "Critical: For coding or complex automation tasks, use 'ps_script' and provide the full PowerShell code in the 'query' field."
@@ -223,7 +251,7 @@ _SYS_CHAT_PROMPT = (
 
 # ── Helper: Đọc config.json ───────────────────────────────────────────────
 def _load_config() -> Dict[str, Any]:
-    cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    cfg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
     if os.path.exists(cfg_path):
         try:
             with open(cfg_path, "r", encoding="utf-8") as f:
@@ -304,7 +332,7 @@ class OllamaCommandInterpreter:
             os.getenv("OLLAMA_DISABLE_REASONING", cfg.get("ollama_disable_reasoning", True)),
             default=True,
         )
-        self.local_timeout = float(os.getenv("OLLAMA_LOCAL_TIMEOUT") or cfg.get("ollama_local_timeout", 12))
+        self.local_timeout = float(os.getenv("OLLAMA_LOCAL_TIMEOUT") or cfg.get("ollama_local_timeout", 20))
         self.cloud_local_timeout = float(
             os.getenv("OLLAMA_CLOUD_LOCAL_TIMEOUT") or cfg.get("ollama_cloud_local_timeout", 35)
         )
@@ -325,7 +353,26 @@ class OllamaCommandInterpreter:
         self._last_check: float = 0.0
         self._sector_resolver = ActionExecutor()
 
-        # ── Circuit Breaker (Tier 2 → Tier 3) ────────────────────────────────
+        # Callback được gọi TRƯỚC khi Bonsai-8B bắt đầu suy luận (để UI thông báo).
+        # Caller tự set/reset sau mỗi lần dùng.
+        self.bonsai_notify_cb = None  # type: Optional[callable]
+
+        # ── Bonsai-8B (Tier 2: giữa Ollama 1B và Cloud) ───────────────────────
+        self.bonsai_enabled = _to_bool(
+            os.getenv("BONSAI_ENABLED", cfg.get("bonsai_enabled", True)),
+            default=True,
+        )
+        if self.bonsai_enabled:
+            try:
+                from .bonsai_client import get_bonsai_client
+                self._bonsai = get_bonsai_client()
+            except Exception as _e:
+                log.warning(f"[Bonsai] Không load được bonsai_client: {_e}")
+                self._bonsai = None
+        else:
+            self._bonsai = None
+
+        # ── Circuit Breaker (Tier 3 Cloud) ────────────────────────────────────
         self._cb_fails: int = 0
         self._cb_open_until: float = 0.0
         self._cb_max_fails: int = int(cfg.get("cb_cloud_max_fails", 3))
@@ -416,6 +463,12 @@ class OllamaCommandInterpreter:
             max_tokens=max_tokens,
             timeout=self.local_timeout,
         )
+
+    def _call_bonsai(self, messages: List[Dict], max_tokens: Optional[int] = None) -> Optional[str]:
+        """Gọi Bonsai-8B tier 2. Tự động wake nếu đang sleep. Trả về string thô hoặc None."""
+        if not getattr(self, "_bonsai", None) or not self.bonsai_enabled:
+            return None
+        return self._bonsai.chat(messages, max_tokens=max_tokens or self.command_max_tokens)
 
     def _call_ollama_model(
         self,
@@ -542,18 +595,24 @@ class OllamaCommandInterpreter:
             {"role": "user",   "content": text.strip()},
         ]
         
-        # Try Cloud first for best "intelligence"
-        if self.cloud_enabled:
-            resp = self._call_cloud(messages, max_tokens=self.chat_max_tokens)
-            if resp:
-                return _strip_reasoning_artifacts(resp)
-            
-        # Try Local
+        # Tier 1: Ollama 1B local (nhanh, ít tốn điện)
         if self._check_local():
             resp = self._call_local(messages, max_tokens=self.chat_max_tokens)
             if resp:
                 return _strip_reasoning_artifacts(resp)
-            
+
+        # Tier 2: Bonsai-8B (tự động wake nếu đang sleep)
+        if getattr(self, "_bonsai", None) and self.bonsai_enabled:
+            resp = self._call_bonsai(messages, max_tokens=self.chat_max_tokens)
+            if resp:
+                return _strip_reasoning_artifacts(resp)
+
+        # Tier 3: Cloud — fallback cuối cùng
+        if self.cloud_enabled:
+            resp = self._call_cloud(messages, max_tokens=self.chat_max_tokens)
+            if resp:
+                return _strip_reasoning_artifacts(resp)
+
         return "Em xin lỗi, bộ não của em đang gặp chút sự cố kết nối..."
 
     # ── Main interpret ────────────────────────────────────────────────────────
@@ -575,15 +634,20 @@ class OllamaCommandInterpreter:
         if not matched:
             return None
 
-        sector_id = str(matched.get("id", "")).strip()
+        sector_id   = str(matched.get("id", "")).strip()
         sector_name = str(matched.get("name", "")).strip() or sector_id
+        sector_url  = str(matched.get("url", "")).strip()
+        sector_exe  = str(matched.get("exe_path", "")).strip()
         return {
-            "action": "penta",
-            "target": "sector",
-            "query": sector_id or sector_name,
-            "source": "sectors-shortcut",
+            "action":      "penta",
+            "target":      "sector",
+            "query":       sector_id or sector_name,
+            "source":      "sectors-shortcut",
             "sector_name": sector_name,
-            "sector_id": sector_id,
+            "sector_id":   sector_id,
+            # Giữ lại url/exe_path để _map_ollama_to_windows_payload dùng trực tiếp
+            "sector_url":  sector_url,
+            "sector_exe":  sector_exe,
         }
 
     def _is_simple_command(self, text: str) -> bool:
@@ -692,6 +756,14 @@ class OllamaCommandInterpreter:
                 log.info(f"[Direct] play '{query}' on {target}")
                 return {"action": "play", "target": target, "query": query, "source": "direct"}
 
+        # ── "đóng/tắt cửa sổ [Title]" ───────────────────────────────────────
+        m_close = _RE_CLOSE_WINDOW.match(t)
+        if m_close:
+            title = m_close.group(1).strip().strip('"\'“”')
+            if title:
+                log.info(f"[Direct] close window title exactly '{title}'")
+                return {"action": "close_window", "target": "window", "query": title, "source": "direct"}
+
         return None
 
     def interpret(
@@ -735,13 +807,18 @@ class OllamaCommandInterpreter:
         ]
 
         raw_content: Optional[str] = None
+        local_failed = False
 
         def _try_local_parse() -> Optional[Dict[str, Any]]:
-            nonlocal raw_content
+            nonlocal raw_content, local_failed
             if not self._check_local():
+                local_failed = True
+                log.warning("[Local] Ollama không khả dụng (offline hoặc không phản hồi) → bỏ qua Tier 1")
                 return None
             raw_content = self._call_local(messages, max_tokens=self.command_max_tokens)
             if not raw_content:
+                local_failed = True
+                log.warning("[Local] Ollama trả về rỗng hoặc timeout → bỏ qua Tier 1")
                 return None
             parsed = self._extract_json(raw_content)
             if parsed and parsed.get("action"):
@@ -752,7 +829,45 @@ class OllamaCommandInterpreter:
                     "query":  str(parsed.get("query",  parsed.get("parameters", ""))).strip(),
                     "source": "local",
                 }
-            log.warning(f"[Local] Parse fail, raw={raw_content!r}")
+            local_failed = True
+            log.warning("[Local] JSON parse thất bại (model trả thừa text?), raw=%r → thử Tier 2", raw_content[:120])
+            return None
+
+        def _try_bonsai_parse() -> Optional[Dict[str, Any]]:
+            nonlocal raw_content
+            if not getattr(self, "_bonsai", None) or not self.bonsai_enabled:
+                return None
+            # Mặc định chỉ dùng Bonsai cho lệnh phức tạp để tránh wakeup chậm (default True)
+            bonsai_complex_only = _to_bool(
+                _load_config().get("bonsai_cmd_complex_only", True), default=True
+            )
+            if bonsai_complex_only and not self._is_complex_command(text):
+                if not local_failed:
+                    log.info("[Bonsai] Skip — lệnh đơn giản, chưa cần Tier 2 (bonsai_cmd_complex_only=true)")
+                    return None
+                log.info("[Bonsai] Local fail → cho phép Tier 2 cứu lệnh đơn giản, tự sửa typo/voice noise")
+            # Thông báo trước cho caller (UI notify)
+            if callable(self.bonsai_notify_cb):
+                try:
+                    self.bonsai_notify_cb()
+                except Exception:
+                    pass
+            log.info(f"[Bonsai] Tier 2 → phân tích: '{text[:50]}'")
+            raw = self._call_bonsai(messages, max_tokens=self.command_max_tokens)
+            if not raw:
+                return None
+            parsed = self._extract_json(raw)
+            if parsed and parsed.get("action"):
+                log.info(f"[Bonsai] OK: {parsed}")
+                raw_content = raw
+                return {
+                    "action": str(parsed.get("action", "")).strip(),
+                    "target": str(parsed.get("target", "")).strip(),
+                    "query":  str(parsed.get("query",  parsed.get("parameters", ""))).strip(),
+                    "source": "bonsai",
+                }
+            log.warning(f"[Bonsai] Parse fail, raw={raw!r}")
+            raw_content = raw
             return None
 
         def _try_cloud_parse() -> Optional[Dict[str, Any]]:
@@ -783,25 +898,31 @@ class OllamaCommandInterpreter:
             log.warning(f"[Cloud] Parse fail, raw={raw_content!r}")
             return None
 
-        # Local luôn là ưu tiên số 1 để tránh độ trễ cloud cho tác vụ điều khiển thường ngày.
+        # ── Tier 1: Ollama 1B — ưu tiên số 1, nhanh, lệnh đơn giản ──────────
         prefer_local = self._is_simple_command(text)
         local_hit = _try_local_parse()
         if local_hit:
             return local_hit
 
+        # ── Tier 2: Bonsai-8B — lệnh phức tạp hoặc khi Ollama thất bại ──────
+        bonsai_hit = _try_bonsai_parse()
+        if bonsai_hit:
+            return bonsai_hit
+
+        # ── Tier 3: Cloud — fallback cuối cùng (chỉ lệnh phức tạp theo policy)
         cloud_hit = _try_cloud_parse()
         if cloud_hit:
             return cloud_hit
 
         if prefer_local and not self.allow_cloud_for_simple:
             return {
-                "error": "Local parse thất bại; cloud bị khóa cho lệnh đơn giản để giảm độ trễ",
+                "error": "Ollama 1B và Bonsai-8B thất bại; cloud bị tắt cho lệnh đơn giản",
                 "raw": raw_content or "",
             }
 
-        # ── Cả hai đều thất bại ───────────────────────────────────────────────
+        # ── Cả ba tầng đều thất bại ──────────────────────────────────────────
         return {
-            "error": "Không thể phân tích lệnh (cả local và cloud đều thất bại)",
+            "error": "Không thể phân tích lệnh (Ollama 1B, Bonsai-8B, và cloud đều thất bại)",
             "raw": raw_content or "",
         }
 

@@ -27,12 +27,37 @@ from core.web_actions import WebActions
 
 log = logging.getLogger("ActionExecutor")
 
+# ── In-memory sectors pushed from PentaKuRu via HTTP ────────────────────────
+# Được ghi bởi POST /api/kuru/sectors trên AI server.
+# Ưu tiên cao hơn file trên đĩa; không bao giờ None (dict rỗng = chưa có dữ liệu).
+_injected_sectors: Dict[str, Dict[str, Any]] = {}
+
+
+def inject_sectors(data: Dict[str, Any]) -> int:
+    """
+    Nạp sectors từ PentaKuRu vào bộ nhớ AI server.
+    data: dict index → {name, url, exe_path, ...}
+    Trả về số sector đã ghi.
+    """
+    global _injected_sectors
+    _injected_sectors = {str(k): v for k, v in data.items() if isinstance(v, dict)}
+    log.info(f"[ActionExecutor] Đã nhận {len(_injected_sectors)} sectors từ PentaKuRu")
+    return len(_injected_sectors)
+
+
+def get_injected_sectors() -> Dict[str, Dict[str, Any]]:
+    """Trả về bản sao của sectors đang được cache trong bộ nhớ."""
+    return dict(_injected_sectors)
+
 
 # ── Từ khoá nhận biết câu lệnh (không cần gọi Ollama) ───────────────────────
 COMMAND_TRIGGERS = [
-    # Tiếng Việt
+    # Tiếng Việt (có dấu)
     "mở ", "tìm ", "tìm kiếm", "phát ", "bật ", "tắt ", "chạy ",
-    "truy cập", "vào trang", "lấy dữ liệu", "tải về", "search",
+    "truy cập", "vào trang", "lấy dữ liệu", "tải về",
+    # Tiếng Việt không dấu (voice recognition thường bỏ dấu)
+    "mo ", "tim ", "tim kiem", "phat ", "bat ", "tat ", "chay ",
+    "search",
     # Tên platform
     "youtube", "google", "bing", "wikipedia", "github",
     # Tiếng Anh
@@ -221,6 +246,21 @@ class ActionExecutor:
         return cleaned
 
     def _load_sectors(self) -> List[Dict[str, Any]]:
+        # Ưu tiên 1: sectors được PentaKuRu push qua HTTP (in-memory)
+        if _injected_sectors:
+            result = []
+            for idx, payload in _injected_sectors.items():
+                if not isinstance(payload, dict):
+                    continue
+                result.append({
+                    "id": str(idx),
+                    "name": str(payload.get("name", "")).strip(),
+                    "url": str(payload.get("url", "")).strip(),
+                    "exe_path": str(payload.get("exe_path", "")).strip(),
+                })
+            return result
+
+        # Ưu tiên 2: đọc file sectors.json từ đường dẫn đã cấu hình
         if not self._sectors_path or not self._sectors_path.exists():
             return []
 

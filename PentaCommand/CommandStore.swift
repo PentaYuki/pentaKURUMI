@@ -27,11 +27,12 @@ class CommandStore: ObservableObject {
     
     private func loadDefaults() {
         commands = [
+            // ── PC Control ─────────────────────────────────────────────────
             VoiceCommand(
                 name: "Bật PC",
                 trigger: "bật pc",
                 endpoint: "/api/turn-on-pc",
-                icon: "pc",
+                icon: "desktopcomputer",
                 color: "6C63FF",
                 description: "Cấp điện và khởi động Windows PC"
             ),
@@ -43,37 +44,57 @@ class CommandStore: ObservableObject {
                 color: "FF4444",
                 description: "Ngắt điện Windows PC"
             ),
+
+            // ── PentaMi Mode ───────────────────────────────────────────────
             VoiceCommand(
-                name: "Bật AI Studio",
-                trigger: "mở ai",
-                endpoint: "/api/start-ai",
-                icon: "cpu",
-                color: "00FF88",
-                description: "Khởi chạy script AI trên Windows"
+                name: "Bật PentaMi",
+                trigger: "bật chế độ pentami",
+                endpoint: "/api/pentami/on",
+                icon: "heart.fill",
+                color: "FF69B4",
+                description: "Bật chế độ trò chuyện thân mật PentaMi (Bonsai-8B)"
             ),
             VoiceCommand(
-                name: "Trạng thái hệ thống",
-                trigger: "trạng thái",
-                endpoint: "/api/status",
-                icon: "info.circle",
+                name: "Tắt PentaMi",
+                trigger: "tắt chế độ pentami",
+                endpoint: "/api/pentami/off",
+                icon: "heart.slash",
+                color: "AA4488",
+                description: "Tắt chế độ PentaMi, quay về chat thường"
+            ),
+            VoiceCommand(
+                name: "Xoá ngữ cảnh",
+                trigger: "xoá ngữ cảnh",
+                endpoint: "/api/pentami/clear",
+                icon: "xmark.circle",
+                color: "888888",
+                description: "Xoá lịch sử hội thoại PentaMi và bắt đầu lại"
+            ),
+            VoiceCommand(
+                name: "Trạng thái PentaMi",
+                trigger: "trạng thái pentami",
+                endpoint: "/api/pentami/status",
+                icon: "info.bubble",
+                color: "00BFFF",
+                description: "Xem trạng thái chế độ PentaMi và số lượt hội thoại"
+            ),
+
+            // ── System ─────────────────────────────────────────────────────
+            VoiceCommand(
+                name: "Hormone",
+                trigger: "trạng thái cảm xúc",
+                endpoint: "/api/hormone_status",
+                icon: "waveform.path.ecg",
                 color: "FFB800",
-                description: "Kiểm tra trạng thái hệ thống"
+                description: "Xem trạng thái hormone và cảm xúc của AI"
             ),
             VoiceCommand(
-                name: "Bật đèn phòng",
-                trigger: "bật đèn",
-                endpoint: "/api/light/on",
-                icon: "lightbulb",
-                color: "FFD700",
-                description: "Điều khiển đèn qua Home Assistant"
-            ),
-            VoiceCommand(
-                name: "Tắt đèn phòng",
-                trigger: "tắt đèn",
-                endpoint: "/api/light/off",
-                icon: "lightbulb.slash",
-                color: "444466",
-                description: "Tắt đèn qua Home Assistant"
+                name: "Nhắc nhở",
+                trigger: "danh sách nhắc nhở",
+                endpoint: "/api/reminders/status",
+                icon: "bell.fill",
+                color: "FF8C00",
+                description: "Xem danh sách nhắc nhở đang chờ"
             ),
         ]
         saveCommands()

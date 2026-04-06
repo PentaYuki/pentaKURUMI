@@ -54,7 +54,51 @@ from core.schedule_assistant import (
 )
 
 # --- Module tách riêng cho Ollama command ---
-from ollama_command import OllamaCommandInterpreter, get_default_interpreter
+from API_local.ollama_command import OllamaCommandInterpreter, get_default_interpreter
+
+# --- Gmail Notification Daemon ---
+try:
+    from services.gmail_notification_daemon import init_daemon as _init_gmail_daemon, get_daemon as _get_gmail_daemon
+    _GMAIL_DAEMON_AVAILABLE = True
+except Exception as _e_gd:
+    _GMAIL_DAEMON_AVAILABLE = False
+    def _init_gmail_daemon(cfg_fn, bcast_fn): return None
+    def _get_gmail_daemon(): return None
+
+# --- PentaMi chat module ---
+try:
+    from API_local.pentami_chat import PentaMiChat, get_pentami_chat, check_toggle as _pentami_check_toggle
+    _PENTAMI_AVAILABLE = True
+except Exception as _e_pm:
+    _PENTAMI_AVAILABLE = False
+    log = logging.getLogger("UnifiedServer")
+    def get_pentami_chat(): return None  # type: ignore
+    def _pentami_check_toggle(t): return None  # type: ignore
+
+# --- PentaWiki module ---
+try:
+    from engine.wiki_engine import (
+        check_wiki_toggle as _wiki_check_toggle,
+        check_lang_toggle  as _lang_check_toggle,
+        fetch_wiki         as _wiki_fetch,
+        format_wiki_response as _wiki_format,
+        is_informational_query as _wiki_is_query,
+    )
+    _WIKI_AVAILABLE = True
+except Exception as _e_wiki:
+    _WIKI_AVAILABLE = False
+    def _wiki_check_toggle(t): return None  # type: ignore
+    def _lang_check_toggle(t): return None  # type: ignore
+    def _wiki_fetch(q, lang="vi"): return {"ok": False, "title": "", "extract": "", "url": ""}  # type: ignore
+    def _wiki_format(r, lang, ai_prn="em", user_call="anh"): return ""  # type: ignore
+    def _wiki_is_query(t): return True  # type: ignore
+
+# --- SkillManager ---
+try:
+    from skillmanager import get_skill_manager as _get_skill_manager
+    _SKILL_MANAGER = _get_skill_manager()
+except Exception as _e_sm:
+    _SKILL_MANAGER = None
 
 # ── Module Registry ─────────────────────────────────────────────────────────
 _MODULES: Dict[str, Dict[str, Any]] = {
@@ -77,8 +121,8 @@ _MODULES: Dict[str, Dict[str, Any]] = {
     "TextTriggers":         {"module": "hormone.text_triggers",         "class": "TextTriggers",           "group": "hormone"},
     "SemanticLearner":      {"module": "hormone.semantic_trigger_learner","class": "SemanticTriggerLearner","group": "hormone"},
     "TimeHormoneBridge":    {"module": "hormone.time_hormone_bridge",   "class": "TimeHormoneBridge",      "group": "hormone"},
-    "PentaMemory":          {"module": "penta_memory",                  "class": "PentaMemory",            "group": "optional"},
-    "OllamaCommand":        {"module": "ollama_command",                "class": "OllamaCommandInterpreter","group": "optional"},
+    "PentaMemory":          {"module": "API_local.penta_memory",        "class": "PentaMemory",            "group": "optional"},
+    "OllamaCommand":        {"module": "API_local.ollama_command",      "class": "OllamaCommandInterpreter","group": "optional"},
     "UserProfile":          {"module": "core.user_profile",             "class": "UserProfile",            "group": "optional"},
 }
 
@@ -100,6 +144,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 sys.path.append(os.path.join(ROOT, "tts_engine", "voicevox"))
 sys.path.append(os.path.join(ROOT, "tts_engine", "valtec"))
+sys.path.append(os.path.join(ROOT, "tts_engine"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s — %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("UnifiedServer")
@@ -112,15 +157,22 @@ DEFAULT_CONFIG = {
     "chat_tts": True, "chat_speaker": "NF", "chat_speed": 1.0,
     "tts_strict_language_engine": True,
     "chat_use_llm_fallback": False,
-    "ollama_url": "http://localhost:11434", "ollama_model": "qwen3.5:cloud",
+    "ollama_url": "http://localhost:11434", "ollama_model": "llama3.2:1b",
     "ollama_local_schedule_model": "llama3.2:1b",
     "ollama_cloud_url": "", "ollama_cloud_key": "", "ollama_cloud_model": "gpt-4o-mini",
+    "ollama_enable_cloud_fallback": True,
+    "ollama_allow_cloud_for_simple": True,
+    "ollama_command_cloud_policy": "always",
+    "bonsai_cmd_complex_only": True,
     "proactive_idle_hormone_enabled": True,
     "proactive_idle_hormone_after_sec": 300,
     "proactive_break_remind_interval_sec": 7200,
     "proactive_speak_local_when_phone_offline": True,
     "proactive_vi_speaker": "NF",
     "proactive_vi_speed": 1.0,
+    "voicevox_speaker_id": -1,
+    "tts_zh_voice": "zh-CN-XiaoxiaoNeural",
+    "tts_ko_voice": "ko-KR-SunHiNeural",
     "proactive_prompt_rules_path": "core/proactive_prompt_rules.json",
     "proactive_contextual_care_enabled": True,
     "proactive_contextual_idle_sec": 420,
@@ -131,8 +183,32 @@ DEFAULT_CONFIG = {
     "proactive_promise_verify_after_sec": 3600,
     "proactive_mood_playlist_enabled": True,
     "proactive_mood_playlist_cooldown_sec": 1800,
-    "proactive_mood_playlist_url": "https://www.youtube.com/watch?v=jfKfPfyJRdk",
-    "pentakuru_sectors_path": ""
+    # URL nhạc chill fallback khi không có file local trong music/chill_music/
+    # Code sẽ phát local trước, chỉ dùng URL này khi thư mục trống
+    "proactive_mood_playlist_url": "https://www.youtube.com/watch?v=jbUQfGRh5cQ",
+    "pentakuru_sectors_path": "",
+    # ── PentaKuRu Windows integration ────────────────────────────────────────
+    # Bật tích hợp Cloudflare Tunnel (ưu tiên hơn Tailscale direct)
+    "enable_penta_kuru_integration": False,
+    # URL Cloudflare Tunnel của PentaKuRu trên Windows (vd: https://xyz.trycloudflare.com)
+    "penta_kuru_cloudflare_url": "",
+    # Bearer token khớp với auth_token trong PentaKuRu data/server.json
+    "penta_kuru_token": "",
+    # Từ điển URL nhạc theo tên nghệ sĩ / playlist — CMD "phát nhạc X" → mở URL trực tiếp
+    # Ví dụ: {"thy vi": "https://www.youtube.com/...", "lofi": "https://..."}
+    "music_named_urls": {},
+    # ── Gmail Notification ───────────────────────────────────────────────────
+    "email": "",
+    "password": "",
+    "gmail_notification_enabled": False,
+    "gmail_notification_whitelist": [],
+    "gmail_notification_whitelist_file": "data/gmail_notify_whitelist.json",
+    "gmail_notification_retry_interval_sec": 900,
+    "gmail_notification_queue_limit": 5,
+    "gmail_notification_max_announcements_per_cycle": 1,
+    "gmail_notification_unseen_scan_limit": 30,
+    "gmail_notification_max_age_hours": 24,
+    "gmail_notification_ignore_existing_unseen_on_start": True,
 }
 
 def load_config():
@@ -145,6 +221,91 @@ def load_config():
 def save_config(cfg):
     with open(CONFIG_FILE, "w") as f: json.dump(cfg, f, indent=2, ensure_ascii=False)
 
+
+def _resolve_gmail_whitelist_file(cfg: Dict[str, Any]) -> str:
+    rel = str(cfg.get("gmail_notification_whitelist_file", "data/gmail_notify_whitelist.json") or "").strip()
+    if not rel:
+        rel = "data/gmail_notify_whitelist.json"
+    return rel if os.path.isabs(rel) else os.path.join(ROOT, rel)
+
+
+def _normalize_gmail_whitelist(raw: Any) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if isinstance(item, dict):
+            email = str(item.get("email", "")).strip().lower()
+            nick = str(item.get("nickname", "")).strip()
+        elif isinstance(item, str):
+            email = item.strip().lower()
+            nick = ""
+        else:
+            continue
+        if not email:
+            continue
+        out.append({"email": email, "nickname": nick or email.split("@")[0]})
+
+    # Deduplicate by email, keep first
+    seen = set()
+    deduped: List[Dict[str, str]] = []
+    for e in out:
+        em = e["email"]
+        if em in seen:
+            continue
+        seen.add(em)
+        deduped.append(e)
+    return deduped
+
+
+def _load_gmail_notify_whitelist(cfg: Dict[str, Any]) -> List[Dict[str, str]]:
+    path = _resolve_gmail_whitelist_file(cfg)
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return _normalize_gmail_whitelist(json.load(f))
+        except Exception as e:
+            log.warning(f"[GmailWhitelist] Read file failed ({path}): {e}")
+    # Fallback config key (backward compatibility)
+    return _normalize_gmail_whitelist(cfg.get("gmail_notification_whitelist", []))
+
+
+def _save_gmail_notify_whitelist(cfg: Dict[str, Any], whitelist: List[Dict[str, str]]) -> str:
+    path = _resolve_gmail_whitelist_file(cfg)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    normalized = _normalize_gmail_whitelist(whitelist)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(normalized, f, ensure_ascii=False, indent=2)
+
+    # Mirror back to config for old readers.
+    cfg["gmail_notification_whitelist"] = normalized
+    save_config(cfg)
+    return path
+
+# ── PentaState persistence (wiki mode + session language) ────────────────────
+_PENTA_STATE_PATH = os.path.join(ROOT, "data", "penta_state.json")
+
+def _load_penta_state() -> None:
+    global _penta_wiki_mode, _session_lang
+    if os.path.exists(_PENTA_STATE_PATH):
+        try:
+            with open(_PENTA_STATE_PATH, "r", encoding="utf-8") as _f:
+                _st = json.load(_f)
+            _penta_wiki_mode = bool(_st.get("wiki_mode", False))
+            _raw_lang = str(_st.get("session_lang", "vi"))
+            _session_lang = _raw_lang if _raw_lang in {"vi", "en", "ja"} else "vi"
+        except Exception:
+            pass
+
+def _save_penta_state() -> None:
+    try:
+        os.makedirs(os.path.dirname(_PENTA_STATE_PATH), exist_ok=True)
+        with open(_PENTA_STATE_PATH, "w", encoding="utf-8") as _f:
+            json.dump({"wiki_mode": _penta_wiki_mode, "session_lang": _session_lang},
+                      _f, indent=2, ensure_ascii=False)
+    except Exception as _es:
+        log.warning(f"[PentaState] Save failed: {_es}")
+
 # ── Runtime override layer (dùng bởi /admin/connect và /admin/reload_config) ──
 # Keys trong dict này sẽ override file config.json mà không cần restart.
 _runtime_overrides: Dict[str, Any] = {}
@@ -155,6 +316,14 @@ def get(key, default=None):
         return _runtime_overrides[key]
     return load_config().get(key, default)
 
+
+def get_full_config() -> Dict[str, Any]:
+    """Trả về toàn bộ config đã merge runtime overrides."""
+    cfg = load_config()
+    if _runtime_overrides:
+        cfg.update(_runtime_overrides)
+    return cfg
+
 def get_action_executor() -> ActionExecutor:
     return ActionExecutor()
 
@@ -162,8 +331,8 @@ def _reload_runtime_config() -> None:
     """Reload runtime singletons affected by config changes without restarting server."""
     global _ollama_ready
     try:
-        import ollama_command
-        ollama_command._default_interpreter = None
+        import API_local.ollama_command as _oc_mod
+        _oc_mod._default_interpreter = None
     except Exception:
         pass
     _ollama_ready = check_ollama()
@@ -176,12 +345,30 @@ async def verify_token(request: Request):
     if token != get("auth_token"): raise HTTPException(status_code=401, detail="Unauthorized")
     return token
 
-# ─── AI & TTS Engines ──────────────────────────────────────────────
+# ─── TTS Manager (module tách riêng) ──────────────────────────────
+from tts_manager import (
+    init_voicevox, init_valtec, reset_engines as _tts_reset_engines,
+    init_all as _tts_init_all,
+    get_voicevox, get_valtec,
+    detect_language, resample_wav,
+    synthesize as _tts_synthesize,
+    synth_jp, list_voicevox_speakers, list_valtec_speakers,
+)
+
+# Alias để code bên dưới không đổi
+def _get_vv():   return get_voicevox()
+def _get_vt():   return get_valtec()
+
+# ─── AI Engine ─────────────────────────────────────────────────────
 _ai_instance = None
-_vv_engine = None
-_valtec_tts = None
 _ollama_ready = False
 _proactive_task: Optional[asyncio.Task] = None
+_gmail_daemon = None  # Gmail Notification Daemon instance
+# ── PentaMi mode ─────────────────────────────────────────────────────────────
+_pentami_mode: bool = False
+# ── PentaWiki + session language (persisted across restarts) ─────────────────
+_penta_wiki_mode: bool = False
+_session_lang: str = "vi"   # "vi" | "en" | "ja"
 _last_user_interaction_ts: float = time.time()
 _work_session_start_ts: Optional[float] = None
 _last_break_remind_ts: float = 0.0
@@ -199,6 +386,8 @@ _IDEMPOTENCY_TTL: float = 30.0
 # ── Backpressure semaphore ────────────────────────────────────────────────────
 # Tối đa 3 AI ops chạy song song; nếu hàng đợi đầy sau 5s → trả lỗi ngay
 _ai_semaphore = asyncio.Semaphore(3)
+# Khóa phát TTS toàn cục: đảm bảo câu trước phát xong mới tới câu sau.
+_tts_stream_lock = asyncio.Lock()
 
 # ── PentaKuruV4 Integration (Cloudflare) ──────────────────────────────────────
 _penta_kuru_health: Dict[str, any] = {"ok": False, "last_check": 0.0}
@@ -213,26 +402,6 @@ def init_ai():
         _ai_instance = PentaAI()
     return _ai_instance
 
-def init_voicevox():
-    global _vv_engine
-    if _vv_engine is None:
-        try:
-            from voicevox_engine import VoicevoxEngine
-            _vv_engine = VoicevoxEngine(os.path.join(ROOT, "tts_engine", "voicevox"))
-            log.info("✅ Voicevox sẵn sàng")
-        except: pass
-    return _vv_engine
-
-def init_valtec():
-    global _valtec_tts
-    if _valtec_tts is None:
-        try:
-            from valtec_server import ValtecEngine
-            _valtec_tts = ValtecEngine()
-            log.info("✅ Valtec sẵn sàng")
-        except: pass
-    return _valtec_tts
-
 def check_ollama():
     global _ollama_ready
     try:
@@ -241,102 +410,201 @@ def check_ollama():
     except: _ollama_ready = False
     return _ollama_ready
 
-# ─── Audio Helpers ──────────────────────────────────────────────────
-def resample_wav(wav_bytes: bytes, target_rate: int = 44100) -> bytes:
-    try:
-        if len(wav_bytes) < 44: return wav_bytes
-        channels = struct.unpack('<H', wav_bytes[22:24])[0]
-        sample_rate = struct.unpack('<I', wav_bytes[24:28])[0]
-        bits_per_sample = struct.unpack('<H', wav_bytes[34:36])[0]
-        if sample_rate == target_rate: return wav_bytes
-        if bits_per_sample != 16: return wav_bytes
-        offset = 12
-        while offset + 8 <= len(wav_bytes):
-            if wav_bytes[offset:offset+4] == b'data': break
-            offset += 8 + struct.unpack('<I', wav_bytes[offset+4:offset+8])[0]
-        else: return wav_bytes
-        pcm = wav_bytes[offset+8:offset+8+struct.unpack('<I', wav_bytes[offset+4:offset+8])[0]]
-        pcm, _ = audioop.ratecv(pcm, 2, channels, sample_rate, target_rate, None)
-        header = bytearray(wav_bytes[:44])
-        struct.pack_into('<I', header, 4, 36+len(pcm))
-        struct.pack_into('<I', header, 24, target_rate)
-        struct.pack_into('<I', header, 28, target_rate*channels*2)
-        struct.pack_into('<I', header, 40, len(pcm))
-        return bytes(header) + pcm
-    except: return wav_bytes
-
+# ─── Audio / TTS Helpers (delegate sang tts_manager) ──────────────────
 async def generate_edge_tts_audio(text, voice="en-US-AvaNeural", rate=1.0):
-    try:
-        r_str = f"{int((rate-1)*100):+d}%"
-        comm = edge_tts.Communicate(text, voice, rate=r_str)
-        data = b""
-        async for chunk in comm.stream():
-            if chunk["type"] == "audio": data += chunk["data"]
-        return data
-    except Exception as e:
-        log.error(f"Edge-TTS error: {e}"); return b""
+    """Compat shim — delegate sang tts_manager._edge_tts()."""
+    from tts_manager import _edge_tts
+    return await _edge_tts(text, voice=voice, rate=rate)
 
-async def generate_voicevox_audio(text, speed):
-    try:
-        from voicevox_engine import SynthParams
-        loop = asyncio.get_event_loop()
-        raw = await loop.run_in_executor(None, lambda: _vv_engine.get_audio(text, _vv_engine.scan_models()[0]["vvm"], SynthParams(speed=speed)))
-        return resample_wav(raw)
-    except: return b""
+async def generate_voicevox_audio(text, speed, speaker_id: int = -1):
+    """Compat shim — delegate sang tts_manager.synth_jp()."""
+    return await synth_jp(text, speed=speed, speaker_id=speaker_id, strict=False)
+
 
 async def generate_valtec_audio(text, speaker, speed):
-    try:
-        loop = asyncio.get_event_loop()
-        raw = await loop.run_in_executor(None, lambda: _valtec_tts._raw_synth(text, speaker, speed))
-        return resample_wav(raw)
-    except: return b""
+    """Compat shim — gọc nắng sang tts_manager.synth_vi()."""
+    from tts_manager import synth_vi
+    return await synth_vi(text, speaker, speed)
 
 _SENT_RE = re.compile(r'(?<=[.!?।。！？])\s+|(?<=\n)')
 def split_sentences(text):
     return [p.strip() for p in _SENT_RE.split(text) if p.strip()]
 
-def detect_language(text):
-    txt = (text or "")
-    if re.search(r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]', txt):
-        return 'jp'
-    lower = txt.lower()
-    if re.search(r'[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]', lower):
-        return 'vi'
-    if re.search(r'\b(anh|em|lich|lịch|thu|thứ|hom nay|hôm nay|duoc roi|được rồi|nha|nè|nhe)\b', lower):
-        return 'vi'
-    return 'en' if re.search(r'[a-zA-Z]', txt) else 'vi'
+# ── Cmd response pools (voice-friendly) ──────────────────────────────────────
+_CMD_NOTLIKE_POOL = [
+    "Câu này giống chat hơn lệnh. Anh thử 'mở ...', 'tìm ...', hoặc chuyển sang chế độ CHAT nha!",
+    "Em đang ở chế độ lệnh, câu này em chưa đọc ra lệnh. Anh thử nói gọn hơn kiểu 'mở youtube' hay 'tìm nhạc' nhé.",
+    "Lệnh chưa rõ. Anh nói kiểu 'mở ...', 'tìm ... trên ...' giúp em với nha.",
+    "Câu này em nghe nhưng chưa ra lệnh hệ thống. Anh nói tắt hơn giúp em nhé!",
+]
+_CMD_CANT_EXEC_POOL = [
+    "Em hiểu ý anh nhưng lệnh này em chưa thực thi được lúc này.",
+    "Ý anh em biết, nhưng lệnh này chưa hỗ trợ. Anh thử cách khác xem nha.",
+    "Em nhận ra ý định nhưng chưa có cách thực hiện lệnh này. Anh thử nói cụ thể hơn nhé.",
+    "Chưa thực thi được lần này. Anh thử gọi tên lệnh rõ hơn giúp em nha.",
+]
+_CMD_WIN_FAIL_POOL = [
+    "Ủa có vẻ lệnh gặp trục trặc. Anh kiểm tra PC có đang bật không nha.",
+    "Em gửi lệnh nhưng có lỗi xảy ra. Anh kiểm tra lại kết nối giùm em nhé.",
+    "Lệnh chưa gửi thành công. Anh thử lại sau một chút xem sao.",
+    "Có lỗi nhỏ xảy ra. Anh kiểm tra PC và kết nối Tailscale giúp em nhé.",
+    "Em chưa gửi được lệnh. Anh xem lại PC có đang hoạt động không nha.",
+]
+_CMD_RECEIVED_POOL = [
+    "Nhận lệnh rồi, để {prn} thực hiện ngay!",
+    "Oke {usr}, {prn} xử lý liền nha!",
+    "{prn_cap} nhận rồi, chờ {prn} một chút nhé!",
+    "Rồi, {prn} làm liền đây!",
+    "Dạ nhận, {prn} thực hiện ngay cho {usr}!",
+]
 
+def _build_cmd_ack_text(cmd_res: dict, ai_pronoun: str = "em", user_call: str = "anh") -> str:
+    """Tạo câu xác nhận lệnh thực thi bằng ngôn ngữ tự nhiên, KHÔNG đọc URL/path thô."""
+    import urllib.parse as _up
+    action = str(cmd_res.get("action", "")).strip().lower()
+    target = str(cmd_res.get("target", "")).strip()
+    query  = str(cmd_res.get("query", "")).strip()
 
-async def synthesize_tts_by_language(text: str, speaker: str, speed: float):
+    # Trích tên đẹp từ URL (https://www.youtube.com → YouTube)
+    def _pretty(url_or_name: str) -> str:
+        if url_or_name.startswith("http"):
+            try:
+                host = _up.urlparse(url_or_name).hostname or url_or_name
+                name = host.lstrip("www.").split(".")[0]
+                return name.title()
+            except Exception:
+                return "trang web"
+        return url_or_name
+
+    platform = _pretty(target) if target else "Google"
+    q = query or ""
+
+    if action == "search":
+        if q:
+            pool = [
+                f"Đang tìm '{q}' trên {platform} cho {user_call}...",
+                f"{ai_pronoun.capitalize()} tìm '{q}' trên {platform} ngay nha!",
+                f"Tìm '{q}' trên {platform} rồi đó {user_call} ơi!",
+                f"Em tìm '{q}' trên {platform} liền cho {user_call} nha!",
+            ]
+        else:
+            pool = [
+                f"Mở {platform} cho {user_call} rồi nha!",
+                f"{ai_pronoun.capitalize()} đã vào {platform} rồi đó!",
+            ]
+    elif action == "open":
+        pool = [
+            f"Mở {platform} cho {user_call} rồi nha!",
+            f"{ai_pronoun.capitalize()} đã mở {platform} rồi đó!",
+            f"Vào {platform} ngay rồi nha {user_call}!",
+            f"{platform} đang mở lên rồi đó {user_call} ơi!",
+        ]
+    elif action == "play":
+        label = q or target
+        pool = [
+            f"Phát '{label}' lên cho {user_call} rồi nha!",
+            f"Bật '{label}' lên rồi đó {user_call} ơi!",
+            f"{ai_pronoun.capitalize()} bật '{label}' lên rồi nha!",
+        ]
+    elif action == "run":
+        app_name = _pretty(target) if target else "ứng dụng"
+        pool = [
+            f"Mở {app_name} lên rồi nha {user_call}!",
+            f"{ai_pronoun.capitalize()} mở {app_name} rồi đó!",
+            f"{app_name} đang khởi động lên đó {user_call} ơi!",
+        ]
+    elif action == "penta":
+        sec_name = str(cmd_res.get("sector_name", "")).strip() or _pretty(target) or "ứng dụng"
+        pool = [
+            f"Mở {sec_name} lên rồi đó nhe {user_call}! 💕",
+            f"{ai_pronoun.capitalize()} bật {sec_name} cho {user_call} rồi nha!",
+            f"{sec_name} đang mở lên rồi đó {user_call} ơi!",
+            f"Xong rồi nhe {user_call}, {sec_name} ra ngay thôi!",
+            f"{ai_pronoun.capitalize()} mở {sec_name} cho {user_call} rồi á, dễ thôi mà!",
+        ]
+    else:
+        pool = [
+            f"Xong rồi nha {user_call}, {ai_pronoun} đã thực hiện xong!",
+            f"Oke {user_call}, lệnh đã được gửi rồi.",
+            f"{ai_pronoun.capitalize()} xử lý xong rồi nha!",
+            f"Đã thực hiện nha {user_call}!",
+        ]
+    return random.choice(pool)
+
+async def synthesize_tts_by_language(
+    text: str,
+    speaker: str,
+    speed: float,
+    force_lang: Optional[str] = None,
+    strict: Optional[bool] = None,
+) -> tuple:
+    """Wrapper gọc nắng sang tts_manager.synthesize() với config hiện tại."""
+    strict_flag = bool(get("tts_strict_language_engine", True)) if strict is None else bool(strict)
+    return await _tts_synthesize(
+        text=text,
+        speaker=speaker,
+        speed=speed,
+        force_lang=force_lang,
+        strict=strict_flag,
+        zh_voice=str(get("tts_zh_voice", "zh-CN-XiaoxiaoNeural")).strip() or "zh-CN-XiaoxiaoNeural",
+        ko_voice=str(get("tts_ko_voice", "ko-KR-SunHiNeural")).strip() or "ko-KR-SunHiNeural",
+        voicevox_speaker_id=int(get("voicevox_speaker_id", -1)),
+    )
+
+# ─── Local Music Player ───────────────────────────────────────────────────────
+_MUSIC_EXTS = {".mp3", ".m4a", ".flac", ".wav", ".aac", ".ogg"}
+
+def _pick_random_song(subfolder: str = "") -> Optional[str]:
     """
-    Routing rule mặc định:
-      - VI -> Valtec
-      - JP -> VoiceVox
-      - EN -> EdgeTTS
-    Nếu bật strict (`tts_strict_language_engine`), không fallback chéo engine.
+    Chọn ngẫu nhiên một file nhạc từ music/ hoặc music/<subfolder>/.
+    Trả về đường dẫn tuyệt đối, hoặc None nếu không có file.
     """
-    lang = detect_language(text)
-    strict = bool(get("tts_strict_language_engine", True))
+    music_root = os.path.join(ROOT, "music")
+    folder     = os.path.join(music_root, subfolder) if subfolder else music_root
+    if not os.path.isdir(folder):
+        return None
+    files = [
+        f for f in os.listdir(folder)
+        if os.path.splitext(f)[1].lower() in _MUSIC_EXTS
+    ]
+    if not files:
+        return None
+    return os.path.join(folder, random.choice(files))
 
-    if lang == 'vi':
-        if _valtec_tts:
-            return await generate_valtec_audio(text, speaker, speed), False
-        if strict:
-            log.warning("[TTS] Bỏ qua câu VI vì Valtec chưa sẵn (strict mode)")
-            return b"", False
-        # Non-strict fallback (tắt strict bằng config nếu muốn)
-        return await generate_edge_tts_audio(text, voice="vi-VN-HoaiMyNeural", rate=speed), True
 
-    if lang == 'jp':
-        if _vv_engine:
-            return await generate_voicevox_audio(text, speed), False
-        if strict:
-            log.warning("[TTS] Bỏ qua câu JP vì VoiceVox chưa sẵn (strict mode)")
-            return b"", False
-        return await generate_edge_tts_audio(text, voice="ja-JP-NanamiNeural", rate=speed), True
+def _play_local_song(path: str) -> bool:
+    """
+    Phát file nhạc trên macOS bằng `afplay` (không cần cài thêm gì).
+    Fire-and-forget — không chặn event loop.
+    Trả về True nếu lệnh được gửi thành công.
+    """
+    try:
+        subprocess.Popen(
+            ["afplay", path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        log.info(f"[Music] ▶ Phát: {os.path.basename(path)}")
+        return True
+    except Exception as e:
+        log.warning(f"[Music] Không phát được nhạc: {e}")
+        return False
 
-    # EN default
-    return await generate_edge_tts_audio(text, rate=speed), True
+
+def _play_music_subfolder(subfolder: str = "", fallback_subfolder: str = "") -> Optional[str]:
+    """
+    Chọn + phát nhạc từ subfolder. Nếu subfolder trống thì thử fallback_subfolder.
+    Trả về tên bài đã phát, hoặc None.
+    """
+    path = _pick_random_song(subfolder)
+    if path is None and fallback_subfolder:
+        path = _pick_random_song(fallback_subfolder)
+    if path is None:
+        path = _pick_random_song("")  # fallback toàn bộ music/
+    if path and _play_local_song(path):
+        return os.path.splitext(os.path.basename(path))[0]
+    return None
+
 
 # ─── Control Helpers ───────────────────────────────────────────────
 def get_outlet():
@@ -349,13 +617,28 @@ def pc_ping():
 async def send_to_windows(cmd="", script=""):
     """Send command to Windows PC. Try Cloudflare first if available, fallback to direct Tailscale."""
     global _penta_kuru_cb_fails
+
+    # ── Kiểm tra nhanh: không có phương thức nào được cấu hình → báo lỗi sớm ──
+    _kuru_enabled = bool(get("enable_penta_kuru_integration"))
+    _kuru_url     = str(get("penta_kuru_cloudflare_url", "")).strip()
+    _ts_ip        = str(get("pc_tailscale_ip", "")).strip()
     
+    log.info(f"[send_to_windows] Cloudflare={_kuru_enabled}, Tailscale={_ts_ip}")
+    
+    if not _kuru_enabled and not _ts_ip:
+        log.warning("[send_to_windows] Chưa cấu hình kết nối PC (pc_tailscale_ip trống, Cloudflare tắt)")
+        return {
+            "ok": False,
+            "error": "PC chưa được cấu hình. Mở ⚙ System → đặt pc_tailscale_ip (IP Tailscale/LAN của PC) và pc_auth_token.",
+        }
+
     # ── Option 1: Try Cloudflare Tunnel (Kuru) if healthy ───────────────────
-    if get("enable_penta_kuru_integration"):
-        kuru_url = get("penta_kuru_cloudflare_url", "").strip()
-        kuru_token = get("penta_kuru_token", "").strip()
+    if _kuru_enabled:
+        kuru_url = _kuru_url
+        kuru_token = str(get("penta_kuru_token", "")).strip()
         kuru_ok = await _check_penta_kuru_health()
-        
+        log.info(f"[Cloudflare] Health={kuru_ok}, URL={kuru_url[:50] if kuru_url else 'N/A'}")
+
         if kuru_ok and kuru_url and kuru_token:
             try:
                 loop = asyncio.get_event_loop()
@@ -374,19 +657,28 @@ async def send_to_windows(cmd="", script=""):
                     return result
                 else:
                     _penta_kuru_cb_fails += 1
-                    log.warning(f"⚠️ Kuru failed, trying direct. Fails: {_penta_kuru_cb_fails}")
+                    log.warning(f"⚠️ Kuru failed ({result.get('error', 'unknown')}), trying direct. Fails: {_penta_kuru_cb_fails}")
             except Exception as e:
                 _penta_kuru_cb_fails += 1
                 log.warning(f"⚠️ Kuru unreachable ({_penta_kuru_cb_fails} fails): {e}")
     
-    # ── Fallback: Direct Tailscale connection ────────────────────────────────
-    url = f"http://{get('pc_tailscale_ip')}:{get('pc_api_port')}/run"
-    headers = {"Authorization": f"Bearer {get('pc_auth_token')}"} if get('pc_auth_token') else {}
+    # ── Fallback: Direct Tailscale/LAN connection ──────────────────────────
+    if not _ts_ip:
+        return {"ok": False, "error": "pc_tailscale_ip chưa được đặt trong cấu hình."}
+    url = f"http://{_ts_ip}:{get('pc_api_port', 7777)}/run"
+    _pc_token = str(get('pc_auth_token', '')).strip()
+    headers = {"Authorization": f"Bearer {_pc_token}"} if _pc_token else {}
+    log.info(f"[Tailscale] Trying {url} (auth={'yes' if _pc_token else 'no'})")
+    
     try:
         loop = asyncio.get_event_loop()
         resp = await loop.run_in_executor(None, lambda: requests.post(url, json={"cmd": cmd, "script": script}, headers=headers, timeout=12))
-        return resp.json()
-    except Exception as e: return {"ok": False, "error": str(e)}
+        result = resp.json()
+        log.info(f"[Tailscale] ✅ Success: {result}")
+        return result
+    except Exception as e:
+        log.error(f"[Tailscale] ❌ Failed: {e}")
+        return {"ok": False, "error": f"Không kết nối được tới {_ts_ip}: {e}"}
 
 def _looks_like_ps_script(text: str) -> bool:
     if not text:
@@ -411,6 +703,9 @@ _WIN_SEARCH_URLS: Dict[str, str] = {
     "wiki":      "https://vi.wikipedia.org/wiki/Special:Search?search={}",
     "github":    "https://github.com/search?q={}",
 }
+
+def _ps_single_quote(value: str) -> str:
+    return (value or "").replace("'", "''")
 
 def _map_ollama_to_windows_payload(res: Dict[str, Any]) -> Dict[str, str]:
     """
@@ -448,18 +743,28 @@ def _map_ollama_to_windows_payload(res: Dict[str, Any]) -> Dict[str, str]:
 
     # ── 3. search action → Start-Process search URL ───────────────────────────
     if action == "search":
-        platform = target.lower() if target else "google"
+        # Nếu tìm nhạc trên YouTube → chuyển sang phát nhạc chill nội bộ
+        _MUSIC_KW = {
+            "nhac", "nhạc", "music", "song", "bai hat", "bài hát",
+            "lofi", "chill", "relax", "buon", "buồn", "sad", "tam trang", "tâm trạng",
+            "nghe nhac", "nghe nhạc", "playlist",
+        }
+        _platform = (target or "").lower()
+        _query_low = (query or "").lower()
+        _is_yt = _platform in {"youtube", "yt"}
+        _is_music_query = any(kw in _query_low or kw in _platform for kw in _MUSIC_KW)
+        if _is_yt and _is_music_query:
+            return {"cmd": "", "script": "", "_local_play": "chill_music"}
+        platform = _platform if _platform else "google"
         tmpl = _WIN_SEARCH_URLS.get(platform, _WIN_SEARCH_URLS["google"])
         url = tmpl.format(urllib.parse.quote_plus(query or target))
         esc = url.replace('"', '`"')
         return {"cmd": f'Start-Process "{esc}"', "script": ""}
 
-    # ── 4. play action → YouTube search ──────────────────────────────────────
+    # ── 4. play action → phát nhạc nội bộ từ music/chill_music/ ──────────────
     if action == "play":
-        q = query or target
-        url = _WIN_SEARCH_URLS["youtube"].format(urllib.parse.quote_plus(q))
-        esc = url.replace('"', '`"')
-        return {"cmd": f'Start-Process "{esc}"', "script": ""}
+        # Luôn phát nhạc từ thư mục music/chill_music/ thay vì mở YouTube URL
+        return {"cmd": "", "script": "", "_local_play": "chill_music"}
 
     # ── 5. run action → Start-Process app/exe ────────────────────────────────
     if action == "run":
@@ -467,6 +772,55 @@ def _map_ollama_to_windows_payload(res: Dict[str, Any]) -> Dict[str, str]:
         if app:
             esc = app.replace('"', '`"')
             return {"cmd": f'Start-Process "{esc}"', "script": ""}
+
+    # ── 5.2. close_window action → đóng đúng cửa sổ có tiêu đề khớp chính xác ──
+    if action in {"close_window", "close"}:
+        title = query or target
+        if title and title.lower() != "window":
+            exact_title = _ps_single_quote(title.strip())
+            script = f"""
+$targetTitle = '{exact_title}'
+$matched = Get-Process | Where-Object {{
+    $_.MainWindowHandle -ne 0 -and
+    $_.MainWindowTitle -and
+    $_.MainWindowTitle.Trim().Equals($targetTitle, [System.StringComparison]::InvariantCultureIgnoreCase)
+}}
+
+if (-not $matched) {{
+    Write-Output "WINDOW_NOT_FOUND:$targetTitle"
+    exit 4
+}}
+
+$closed = @()
+foreach ($proc in $matched) {{
+    try {{
+        $null = $proc.CloseMainWindow()
+        Start-Sleep -Milliseconds 1200
+        if (-not $proc.HasExited) {{
+            Stop-Process -Id $proc.Id -Force -ErrorAction Stop
+        }}
+        $closed += $proc.MainWindowTitle
+    }} catch {{
+        Write-Output "WINDOW_CLOSE_ERROR:$($proc.MainWindowTitle):$($_.Exception.Message)"
+        exit 5
+    }}
+}}
+
+Write-Output ("WINDOW_CLOSED:" + ($closed -join " | "))
+""".strip()
+            return {"cmd": "", "script": script}
+
+    # ── 5.5. penta action → mở sector bằng URL hoặc exe ─────────────────────
+    if action == "penta":
+        sector_url = str(res.get("sector_url", "")).strip()
+        sector_exe = str(res.get("sector_exe", "")).strip()
+        if sector_url:
+            esc = sector_url.replace('"', '`"')
+            return {"cmd": f'Start-Process "{esc}"', "script": ""}
+        elif sector_exe:
+            esc = sector_exe.replace('"', '`"')
+            return {"cmd": f'Start-Process "{esc}"', "script": ""}
+        return {"cmd": "", "script": ""}
 
     # ── 6. Fallback cho target/query chưa phân loại ───────────────────────────
     if target:
@@ -484,10 +838,39 @@ def _map_ollama_to_windows_payload(res: Dict[str, Any]) -> Dict[str, str]:
 # ─── FastAPI Lifecycle ─────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _proactive_task
+    global _proactive_task, _gmail_daemon
     import atexit
     log.info("🚀 Warm-up Unified Server...")
     init_ai(); init_voicevox(); init_valtec(); check_ollama()
+    _load_penta_state()  # Khôi phục wiki mode + session language từ lần trước
+    
+    # --- Gmail Notification Daemon ---
+    if _GMAIL_DAEMON_AVAILABLE:
+        try:
+            _server_loop = asyncio.get_running_loop()
+            def _gmail_config_fn():
+                return get_full_config()
+            def _gmail_broadcast_fn(text: str):
+                # Daemon chạy ở thread nền, cần gửi coroutine về event loop chính.
+                fut = asyncio.run_coroutine_threadsafe(
+                    broadcast_proactive(text, _ai_instance or init_ai()),
+                    _server_loop,
+                )
+
+                def _on_done(_f):
+                    try:
+                        _f.result()
+                    except Exception as _e:
+                        log.error(f"[GmailDaemon->Broadcast] {_e}")
+
+                fut.add_done_callback(_on_done)
+            _gmail_daemon = _init_gmail_daemon(_gmail_config_fn, _gmail_broadcast_fn)
+            _gmail_daemon.start()
+            log.info("[Server Startup] ✅ Gmail Notification Daemon started")
+        except Exception as e:
+            log.error(f"[Server Startup] ❌ Gmail daemon init failed: {e}")
+            _gmail_daemon = None
+    
     # Chạy vòng proactive trong đúng event loop của ASGI server.
     _proactive_task = asyncio.create_task(proactive_background_task())
     def _save():
@@ -495,6 +878,12 @@ async def lifespan(app: FastAPI):
             _ai_instance.emotion.flush(); log.info("💾 Saved Hormone state")
     atexit.register(_save)
     yield
+    
+    # --- Shutdown Gmail Daemon ---
+    if _gmail_daemon:
+        _gmail_daemon.stop()
+        log.info("[Server Shutdown] Gmail Notification Daemon stopped")
+    
     if _proactive_task:
         _proactive_task.cancel()
         try:
@@ -526,7 +915,7 @@ async def health():
         hl = {k: round(v, 3) for k, v in ai.emotion.hormone.get().items()}
     return {
         "status": "ok", "ai_ready": ai is not None,
-        "tts_vi": _valtec_tts is not None, "tts_jp": _vv_engine is not None,
+        "tts_vi": get_valtec() is not None, "tts_jp": get_voicevox() is not None,
         "modules_ok": sum(1 for v in ok_mods.values() if v["status"]=="ok"),
         "emotional_state": em, "hormone_levels": hl
     }
@@ -586,14 +975,18 @@ async def set_config_runtime(req: Request, token: str = Depends(verify_token)):
 @app.get("/api/config_cloud")
 async def get_cloud(token: str = Depends(verify_token)):
     c = load_config()
-    return {"status": "ok", "url": c.get("ollama_cloud_url",""), "model": c.get("ollama_cloud_model", "")}
+    return {"status": "ok", "url": c.get("ollama_cloud_url",""), "model": c.get("ollama_cloud_model", ""), "local_model": c.get("ollama_model", "")}
 
 @app.post("/api/config_cloud")
 async def set_cloud(req: Request, token: str = Depends(verify_token)):
     d = await req.json(); c = load_config()
     for k in ["url", "key", "model"]: 
         if k in d: c[f"ollama_cloud_{k}"] = d[k]
-    save_config(c); return {"status": "ok"}
+    if "local_model" in d:
+        c["ollama_model"] = d["local_model"]
+    save_config(c)
+    _reload_runtime_config()
+    return {"status": "ok"}
 
 @app.get("/api/status")
 async def system_status(token: str = Depends(verify_token)):
@@ -674,9 +1067,120 @@ async def teach_api(req: Request, token: str = Depends(verify_token)):
         return {"status": "ok", "response": resp}
     except Exception as e: return {"status": "error", "message": str(e)}
 
+# ─── Gmail Notification API ─────────────────────────────────────────
+@app.get("/api/gmail_notify_whitelist")
+async def gmail_notify_whitelist_get(token: str = Depends(verify_token)):
+    """Lấy danh sách whitelist Gmail notification."""
+    cfg = get_full_config()
+    whitelist = _load_gmail_notify_whitelist(cfg)
+    return {"status": "ok", "whitelist": whitelist, "file": _resolve_gmail_whitelist_file(cfg)}
+
+@app.post("/api/gmail_notify_whitelist")
+async def gmail_notify_whitelist_post(req: Request, token: str = Depends(verify_token)):
+    """
+    Thêm hoặc xóa entry trong whitelist.
+    JSON: {"action": "add" | "remove", "email": "...", "nickname": "..."}
+    """
+    try:
+        d = await req.json()
+        action = d.get("action", "").lower()
+        email = d.get("email", "").strip().lower()
+        nickname = d.get("nickname", "").strip()
+
+        cfg = get_full_config()
+        whitelist = _load_gmail_notify_whitelist(cfg)
+
+        # Bulk set mode from CLI
+        if isinstance(d.get("whitelist"), list):
+            path = _save_gmail_notify_whitelist(cfg, d.get("whitelist", []))
+            return {
+                "status": "ok",
+                "message": "Whitelist replaced",
+                "whitelist": _load_gmail_notify_whitelist(cfg),
+                "file": path,
+            }
+
+        if not email:
+            return {"status": "error", "message": "Email required"}
+        
+        if action == "add":
+            # Check duplicate
+            if any(e["email"].lower() == email for e in whitelist if isinstance(e, dict)):
+                return {"status": "error", "message": "Email already in whitelist"}
+            whitelist.append({"email": email, "nickname": nickname or email.split("@")[0]})
+        elif action == "remove":
+            whitelist = [e for e in whitelist if isinstance(e, dict) and e.get("email", "").lower() != email]
+        else:
+            return {"status": "error", "message": "Invalid action"}
+
+        path = _save_gmail_notify_whitelist(cfg, whitelist)
+        return {
+            "status": "ok",
+            "message": f"Action {action} completed",
+            "whitelist": _load_gmail_notify_whitelist(cfg),
+            "file": path,
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/api/gmail_notify_queue")
+async def gmail_notify_queue_get(token: str = Depends(verify_token)):
+    """Lấy queue email chờ xử lý."""
+    if not _gmail_daemon:
+        return {"status": "error", "message": "Gmail daemon not available"}
+    
+    queue = _gmail_daemon.get_queue()
+    return {"status": "ok", "queue": queue, "count": len(queue)}
+
+@app.post("/api/gmail_notify_response")
+async def gmail_notify_response_post(req: Request, token: str = Depends(verify_token)):
+    """
+    User trả lời email.
+    JSON: {"uid": "...", "response": "yes" | "no"}
+    """
+    if not _gmail_daemon:
+        return {"status": "error", "message": "Gmail daemon not available"}
+    
+    try:
+        d = await req.json()
+        uid = d.get("uid", "")
+        response = d.get("response", "").lower()
+        
+        if response not in ("yes", "no", "1", "0", "true", "false", "có", "không"):
+            return {"status": "error", "message": "Invalid response"}
+        
+        ok = _gmail_daemon.set_user_response(uid, response)
+        return {"status": "ok" if ok else "error", "message": "Response recorded" if ok else "UID not found"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.post("/api/gmail_notify_clear")
+async def gmail_notify_clear_post(token: str = Depends(verify_token)):
+    """Xóa toàn bộ queue Gmail notification."""
+    if not _gmail_daemon:
+        return {"status": "error", "message": "Gmail daemon not available"}
+    n = _gmail_daemon.clear_queue()
+    return {"status": "ok", "cleared": n}
+
+@app.post("/api/gmail_notify_enable")
+async def gmail_notify_enable_post(req: Request, token: str = Depends(verify_token)):
+    """Bật/tắt Gmail notification."""
+    try:
+        d = await req.json()
+        enabled = d.get("enabled", True)
+        
+        cfg = get_full_config()
+        cfg["gmail_notification_enabled"] = bool(enabled)
+        save_config(cfg)
+        
+        status = "enabled" if enabled else "disabled"
+        return {"status": "ok", "message": f"Gmail notification {status}"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 @app.post("/api/ollama_command")
 async def ollama_command_api(req: OllamaCommandRequest, execute: bool = False, token: str = Depends(verify_token)):
-    from ollama_command import get_default_interpreter
+    from API_local.ollama_command import get_default_interpreter
     interp = get_default_interpreter()
     res = interp.interpret(req.text, req.available_commands)
     win_res = None
@@ -690,7 +1194,7 @@ async def ollama_command_api(req: OllamaCommandRequest, execute: bool = False, t
 
 @app.post("/api/execute_pc_command")
 async def execute_pc_command(req: OllamaCommandRequest, token: str = Depends(verify_token)):
-    from ollama_command import get_default_interpreter
+    from API_local.ollama_command import get_default_interpreter
     interp = get_default_interpreter()
     res = interp.interpret(req.text, req.available_commands)
     payload = _map_ollama_to_windows_payload(res)
@@ -704,6 +1208,155 @@ async def pentakuru_sectors_debug(q: str = "", token: str = Depends(verify_token
     return {"status": "ok", **executor.get_sectors_debug(q)}
 
 
+@app.post("/api/kuru/sectors")
+async def kuru_push_sectors(request: Request, token: str = Depends(verify_token)):
+    """
+    PentaKuRu gửi toàn bộ sectors lên AI server sau mỗi lần lưu.
+    Body: {"sectors": {"0": {...}, "1": {...}, ...}}
+    AI server lưu vào bộ nhớ — ActionExecutor dùng trực tiếp, không cần file.
+    """
+    from core.action_executor import inject_sectors
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="JSON không hợp lệ")
+    data = body.get("sectors", body)
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="sectors phải là object {index: {...}}")
+    count = inject_sectors(data)
+    log.info(f"[KuruSectors] Đã nhận {count} sectors từ PentaKuRu")
+    return {"ok": True, "received": count}
+
+
+@app.get("/api/kuru/sectors")
+async def kuru_get_sectors(token: str = Depends(verify_token)):
+    """Trả về sectors hiện tại đang được cache trong bộ nhớ AI server."""
+    from core.action_executor import get_injected_sectors
+    data = get_injected_sectors()
+    return {"ok": True, "count": len(data), "sectors": data}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PENTAMI ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/pentami/status")
+async def pentami_status(token: str = Depends(verify_token)):
+    """Trạng thái chế độ PentaMi."""
+    pm = get_pentami_chat() if _PENTAMI_AVAILABLE else None
+    return {
+        "available": _PENTAMI_AVAILABLE,
+        "mode": _pentami_mode,
+        "context_turns": pm.context_length() if pm else 0,
+    }
+
+
+@app.post("/api/pentami/toggle")
+async def pentami_toggle(token: str = Depends(verify_token)):
+    """Bật / tắt chế độ PentaMi."""
+    global _pentami_mode
+    if not _PENTAMI_AVAILABLE:
+        return {"ok": False, "error": "pentami_chat module không khả dụng"}
+    _pentami_mode = not _pentami_mode
+    ai = init_ai()
+    profile = getattr(getattr(ai, "profile", None), "ai_pronoun", "em")
+    status = "bật" if _pentami_mode else "tắt"
+    return {"ok": True, "mode": _pentami_mode, "message": f"Chế độ PentaMi đã {status}!"}
+
+
+@app.post("/api/pentami/on")
+async def pentami_on(token: str = Depends(verify_token)):
+    """Bật chế độ PentaMi."""
+    global _pentami_mode
+    if not _PENTAMI_AVAILABLE:
+        return {"ok": False, "error": "pentami_chat module không khả dụng"}
+    _pentami_mode = True
+    return {"ok": True, "mode": True, "message": "Chế độ PentaMi đã bật!"}
+
+
+@app.post("/api/pentami/off")
+async def pentami_off(token: str = Depends(verify_token)):
+    """Tắt chế độ PentaMi và tự động xoá context hội thoại (giữ kiến thức đã học)."""
+    global _pentami_mode
+    _pentami_mode = False
+    if _PENTAMI_AVAILABLE:
+        pm = get_pentami_chat()
+        pm.clear_context()   # Xoá lịch sử chat, knowledge.json không bị ảnh hưởng
+    return {"ok": True, "mode": False, "message": "Chế độ PentaMi đã tắt và lịch sử hội thoại đã được xoá. Kiến thức đã học vẫn được giữ lại."}
+
+
+@app.post("/api/pentami/clear")
+async def pentami_clear(token: str = Depends(verify_token)):
+    """Xoá ngữ cảnh hội thoại PentaMi."""
+    if not _PENTAMI_AVAILABLE:
+        return {"ok": False, "error": "pentami_chat module không khả dụng"}
+    pm = get_pentami_chat()
+    pm.clear_context()
+    return {"ok": True, "message": "Ngữ cảnh đã được xoá."}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PENTAWIKI ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/wiki/status")
+async def wiki_status(token: str = Depends(verify_token)):
+    """Trả về trạng thái PentaWiki và ngôn ngữ phiên làm việc hiện tại."""
+    return {
+        "available": _WIKI_AVAILABLE,
+        "wiki_mode": _penta_wiki_mode,
+        "session_lang": _session_lang,
+    }
+
+
+@app.post("/api/wiki/on")
+async def wiki_on(token: str = Depends(verify_token)):
+    """Bật PentaWiki mode."""
+    global _penta_wiki_mode
+    if not _WIKI_AVAILABLE:
+        return {"ok": False, "error": "wiki_engine module không khả dụng"}
+    _penta_wiki_mode = True
+    _save_penta_state()
+    return {"ok": True, "wiki_mode": True, "session_lang": _session_lang}
+
+
+@app.post("/api/wiki/off")
+async def wiki_off(token: str = Depends(verify_token)):
+    """Tắt PentaWiki mode."""
+    global _penta_wiki_mode
+    _penta_wiki_mode = False
+    _save_penta_state()
+    return {"ok": True, "wiki_mode": False}
+
+
+@app.post("/api/wiki/lang")
+async def wiki_set_lang(req: Request, token: str = Depends(verify_token)):
+    """Đặt ngôn ngữ phiên: vi | en | ja."""
+    global _session_lang
+    data = await req.json()
+    lang = str(data.get("lang", "vi")).strip().lower()
+    if lang not in {"vi", "en", "ja"}:
+        return {"ok": False, "error": "lang phải là vi, en, hoặc ja"}
+    _session_lang = lang
+    _save_penta_state()
+    return {"ok": True, "session_lang": _session_lang}
+
+
+@app.post("/api/wiki/search")
+async def wiki_search_api(req: Request, token: str = Depends(verify_token)):
+    """Tra cứu Wikipedia trực tiếp qua API (không cần bật wiki mode)."""
+    data = await req.json()
+    query = str(data.get("query", "")).strip()
+    lang  = str(data.get("lang", _session_lang)).strip().lower()
+    if not query:
+        return {"ok": False, "error": "query rỗng"}
+    if lang not in {"vi", "en", "ja"}:
+        lang = _session_lang
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, lambda: _wiki_fetch(query, lang))
+    return result
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  ADMIN ENDPOINTS  — dùng bởi penta_ctl.py
 # ══════════════════════════════════════════════════════════════════════════════
@@ -711,7 +1364,7 @@ async def pentakuru_sectors_debug(q: str = "", token: str = Depends(verify_token
 @app.get("/admin/status")
 async def admin_status(token: str = Depends(verify_token)):
     """Full live stats: WS clients, circuit breakers, hormone, last interaction."""
-    from ollama_command import get_default_interpreter
+    from API_local.ollama_command import get_default_interpreter
     interp = get_default_interpreter()
     ai = init_ai()
 
@@ -848,7 +1501,7 @@ async def admin_test_cmd(req: Request, token: str = Depends(verify_token)):
     if not text:
         return {"ok": False, "error": "Thiếu 'text'"}
 
-    from ollama_command import get_default_interpreter, OllamaCommandInterpreter
+    from API_local.ollama_command import get_default_interpreter, OllamaCommandInterpreter
     interp = get_default_interpreter()
 
     t0 = time.perf_counter()
@@ -946,8 +1599,8 @@ async def admin_reload_config(req: Request, token: str = Depends(verify_token)):
             return {"ok": False, "error": f"Lưu config thất bại: {e}"}
 
     # Reset Ollama interpreter singleton để pick up new policy
-    from ollama_command import _default_interpreter
-    import ollama_command as _oc
+    from API_local.ollama_command import _default_interpreter
+    import API_local.ollama_command as _oc
     _oc._default_interpreter = None  # force re-init next call
 
     return {
@@ -958,6 +1611,68 @@ async def admin_reload_config(req: Request, token: str = Depends(verify_token)):
     }
 
 
+
+@app.get("/api/voicevox_speakers")
+async def voicevox_speakers(token: str = Depends(verify_token)):
+    """Trả về danh sách toàn bộ speaker/style của VoiceVox đang tải."""
+    speakers = list_voicevox_speakers()
+    if not speakers:
+        return {"ok": False, "speakers": [], "error": "VoiceVox chưa sẵn sàng hoặc chưa có model"}
+    return {"ok": True, "speakers": speakers}
+
+
+@app.get("/api/valtec_speakers")
+async def valtec_speakers_api(token: str = Depends(verify_token)):
+    """Trả về danh sách speaker Valtec (tiếng Việt) đang tải."""
+    speakers = list_valtec_speakers()
+    # Fallback khi Valtec chưa load — trả về tên mặc định phổ biến
+    if not speakers:
+        speakers = ["NF", "NN", "SF", "SN"]
+    return {"ok": True, "speakers": speakers, "loaded": get_valtec() is not None}
+
+
+@app.post("/api/tts_test")
+async def tts_test(req: Request, token: str = Depends(verify_token)):
+    """
+    Test phát thử giọng VoiceVox với speaker_id tuỳ chọn.
+    Body: {"text": "...", "speaker_id": 0, "speed": 1.0}
+    Trả về audio/wav (stream trực tiếp).
+    """
+    from fastapi.responses import Response as FResponse
+    data = await req.json()
+    text = (data.get("text") or "").strip()
+    if not text:
+        return {"ok": False, "error": "text rỗng"}
+    if get_voicevox() is None:
+        return {"ok": False, "error": "VoiceVox chưa sẵn sàng"}
+    speaker_id = int(data.get("speaker_id", -1))
+    speed = float(data.get("speed", 1.0))
+    wav = await synth_jp(text, speed=speed, speaker_id=speaker_id, strict=False)
+    if not wav:
+        return {"ok": False, "error": "Tổng hợp thất bại (check log server)"}
+    return FResponse(content=wav, media_type="audio/wav")
+
+
+@app.post("/admin/reset_ai")
+async def admin_reset_ai(token: str = Depends(verify_token)):
+    """
+    Reset toàn bộ AI instance + Voicevox + Valtec.
+    Dùng sau khi nâng cấp module mà không muốn restart server.
+    """
+    global _ai_instance
+    try:
+        if _ai_instance and hasattr(_ai_instance, "emotion") and _ai_instance.emotion:
+            try: _ai_instance.emotion.flush()
+            except Exception: pass
+        _ai_instance = None
+        _tts_reset_engines()
+        import API_local.ollama_command as _oc
+        _oc._default_interpreter = None
+        # Reinit
+        init_ai(); _tts_init_all()
+        return {"ok": True, "message": "AI instance đã được reset và khởi tạo lại."}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 @app.post("/admin/reload_prompt_rules")
 async def admin_reload_prompt_rules(req: Request, token: str = Depends(verify_token)):
         """
@@ -1001,15 +1716,18 @@ def _enforce_profile_pronouns(text: str, ai: Any) -> str:
     if detect_language(text) != "vi":
         return text
 
-    user_call = str(getattr(profile, "user_call", "") or getattr(profile, "pronoun", "bạn") or "bạn").strip()
+    user_call  = str(getattr(profile, "user_call", "") or getattr(profile, "pronoun", "bạn") or "bạn").strip()
     ai_pronoun = str(getattr(profile, "ai_pronoun", "mình") or "mình").strip()
 
+    # Dùng placeholder NULL bytes để tránh double-replacement khi
+    # user_call / ai_pronoun giống hoặc chứa "anh"/"em" (vd: cặp em/anh ngược).
+    _U = "\x00U\x00"
+    _A = "\x00A\x00"
     out = str(text)
-    # Áp dụng cho các mẫu server hiện có vốn mặc định anh/em.
-    out = re.sub(r"\banh\b", user_call, out, flags=re.IGNORECASE)
-    out = re.sub(r"\bem\b", ai_pronoun, out, flags=re.IGNORECASE)
-    out = re.sub(r"\bAnh\b", user_call.capitalize(), out)
-    out = re.sub(r"\bEm\b", ai_pronoun.capitalize(), out)
+    out = re.sub(r"\banh\b", _U, out, flags=re.IGNORECASE)
+    out = re.sub(r"\bem\b",  _A, out, flags=re.IGNORECASE)
+    out = out.replace(_U, user_call)
+    out = out.replace(_A, ai_pronoun)
     return out
 
 
@@ -1045,13 +1763,104 @@ def _reminder_next_due_iso(reminder: Dict[str, Any], now: Optional[datetime] = N
 
 
 def _speak_local_mac(text: str) -> None:
+    """Fallback cuối: macOS `say` (không hỗ trợ dấu tiếng Việt tốt)."""
     if not text or sys.platform != "darwin":
         return
     try:
-        # Giới hạn độ dài để tránh block lâu nếu text quá dài.
         subprocess.run(["say", text[:280]], timeout=10)
     except Exception:
         pass
+
+
+async def _chat_in_lang_async(text: str, lang: str, ai: Any) -> str:
+    """
+    Gọi Ollama để trả lời bằng ngôn ngữ cụ thể (en / ja).
+    Trả về chuỗi trống nếu Ollama không sẵn sàng.
+    """
+    if lang == "vi":
+        return ""
+    try:
+        from API_local.ollama_command import get_default_interpreter
+        interp = get_default_interpreter()
+        if not interp._check_local():
+            return ""
+        profile   = getattr(ai, "profile", None)
+        user_call = str(getattr(profile, "user_call", "") or getattr(profile, "pronoun", "you") or "you").strip()
+        ai_prn    = str(getattr(profile, "ai_pronoun", "I") or "I").strip()
+        sys_prompts = {
+            "en": (
+                f"You are a friendly AI assistant named Kurumi. "
+                f"Reply ONLY in English. The user's name is '{user_call}'. "
+                f"Keep replies warm, concise (≤3 sentences), and helpful. No markdown."
+            ),
+            "ja": (
+                f"あなたはKurumiという名前の親切なAIアシスタントです。"
+                f"必ず日本語のみで返答してください。ユーザーの名前は「{user_call}」です。"
+                f"返答は温かく、簡潔（3文以内）にしてください。マークダウン不要。"
+            ),
+        }
+        sys_prompt = sys_prompts.get(lang, "")
+        if not sys_prompt:
+            return ""
+        model_name = str(get("ollama_model", "")).strip() or interp.model
+        msgs = [
+            {"role": "system",  "content": sys_prompt},
+            {"role": "user",    "content": text.strip()},
+        ]
+        loop = asyncio.get_event_loop()
+        raw = await loop.run_in_executor(
+            None,
+            lambda: interp._call_ollama_model(
+                model_name=model_name, messages=msgs, max_tokens=220, timeout=18,
+            ),
+        )
+        if raw:
+            return re.sub(r"\s+", " ", raw.strip()).strip()
+    except Exception as _e_lang:
+        log.warning(f"[LangChat:{lang}] {_e_lang}")
+    return ""
+
+
+async def _speak_local_vi_async(text: str) -> None:
+    """
+    Phát TTS tiếng Việt tại Mac khi phone offline.
+    Ưu tiên Valtec → Edge TTS vi-VN-HoaiMyNeural → macOS say.
+    Audio được play qua afplay (không block event loop).
+    """
+    if not text or sys.platform != "darwin":
+        return
+    try:
+        speaker = str(get("proactive_vi_speaker", "NF")).strip() or "NF"
+        speed   = float(get("proactive_vi_speed", 1.0))
+        if get_valtec():
+            wav = await generate_valtec_audio(text, speaker, speed)
+        else:
+            wav = await generate_edge_tts_audio(text, voice="vi-VN-HoaiMyNeural", rate=speed)
+
+        if wav:
+            import tempfile
+            suffix = ".wav" if get_valtec() else ".mp3"
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tf:
+                tf.write(wav)
+                fname = tf.name
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "afplay", fname,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=60)
+            except asyncio.TimeoutError:
+                try: proc.kill()
+                except Exception: pass
+            finally:
+                try: os.unlink(fname)
+                except Exception: pass
+        else:
+            _speak_local_mac(text)
+    except Exception as _e_vi:
+        log.warning(f"[LocalVI TTS] error: {_e_vi}")
+        _speak_local_mac(text)
 
 
 def _apply_idle_hormone_drift(ai: Any, idle_seconds: float) -> None:
@@ -1661,7 +2470,7 @@ async def _maybe_open_mood_playlist(ai: Any, now_ts: float) -> None:
         return
 
     levels = ai.emotion.hormone.get()
-    state = ai.emotion.hormone.get_emotional_state()
+    state  = ai.emotion.hormone.get_emotional_state()
     low_mood = (
         state in {"anxious", "stressed", "tired_uneasy", "low_energy", "mildly_stressed"}
         or (levels.get("cortisol", 0.0) >= 0.52)
@@ -1670,17 +2479,28 @@ async def _maybe_open_mood_playlist(ai: Any, now_ts: float) -> None:
     if not low_mood:
         return
 
-    url = str(get("proactive_mood_playlist_url", "")).strip() or "https://www.youtube.com/watch?v=jfKfPfyJRdk"
-    # Ưu tiên mở playlist trên máy Windows điều khiển từ xa.
-    escaped_url = url.replace('"', '`"')
-    payload_cmd = f'Start-Process "{escaped_url}"'
-    win_res = await send_to_windows(cmd=payload_cmd, script="")
+    _ai_prn = getattr(getattr(ai, "profile", None), "ai_pronoun", "em")
+    _usr_prn = (
+        getattr(getattr(ai, "profile", None), "user_call", "")
+        or getattr(getattr(ai, "profile", None), "pronoun", "anh")
+    )
 
-    note = "Em thấy mood đang thấp nên em bật playlist chill cho anh nha."
+    # Phát nhạc chill từ thư mục music/chill_music (ưu tiên) hoặc music/
+    song_name = _play_music_subfolder("chill_music")
+    if song_name:
+        note = (
+            f"{_ai_prn.capitalize()} thấy mood đang thấp nên "
+            f"{_ai_prn} bật nhạc chill cho {_usr_prn} nha. "
+            f"Đang phát: {song_name}"
+        )
+    else:
+        note = (
+            f"{_ai_prn.capitalize()} thấy mood đang thấp, "
+            f"{_usr_prn} nghỉ ngơi một chút nha. "
+            f"(Thêm nhạc vào thư mục music/chill_music để {_ai_prn} phát nhé!)"
+        )
+
     await broadcast_proactive(note, ai)
-    if not win_res.get("ok") and bool(get("proactive_speak_local_when_phone_offline", True)):
-        _speak_local_mac("Anh ơi em thấy tâm trạng đang xuống, mình nghe nhạc thư giãn một chút nha")
-
     _last_mood_playlist_ts = now_ts
 
 # ── WebSocket Workflow ────────────────────────────────────────────
@@ -1699,15 +2519,16 @@ async def broadcast_proactive(text: str, ai: Any):
         return
     if not _active_ws:
         if bool(get("proactive_speak_local_when_phone_offline", True)):
-            _speak_local_mac(text)
+            # Dùng TTS tiếng Việt đúng thay vì macOS say (không hỗ trợ dấu Vi)
+            asyncio.create_task(_speak_local_vi_async(text))
         return
     log.info(f"📢 [Broadcast] {text}")
-    
+
     # Chuẩn bị data response
     em = ai.emotion.hormone.get_emotional_state() if hasattr(ai, 'emotion') else "normal"
     hl = ai.emotion.hormone.get() if hasattr(ai, 'emotion') else {}
     data = {"type": "response", "text": text, "ai_latency_ms": 0, "emotional_state": em, "hormone_levels": hl}
-    
+
     # Broadcast text đến tất cả client
     to_remove = []
     for ws in list(_active_ws):
@@ -1715,28 +2536,49 @@ async def broadcast_proactive(text: str, ai: Any):
     for ws in to_remove:
         _active_ws.discard(ws)
         _active_ws_meta.pop(ws, None)
-    
+
     # TTS chỉ gửi đến phone client (không gửi lên CLI browser để tránh phát 2 lần)
     phone_ws = [ws for ws in _active_ws if _active_ws_meta.get(ws, {}).get("is_phone", False)]
     if not phone_ws:
         if bool(get("proactive_speak_local_when_phone_offline", True)):
-            _speak_local_mac(text)
+            asyncio.create_task(_speak_local_vi_async(text))
         return
 
-    sents = split_sentences(text)
-    for ws in phone_ws: await safe_send_json(ws, {"type": "tts_start", "total": len(sents)})
-    
-    proactive_speaker = str(get("proactive_vi_speaker", "NF")).strip() or "NF"
-    proactive_speed = float(get("proactive_vi_speed", 1.0))
-    for s in sents:
-        wav, is_edge = await synthesize_tts_by_language(s, proactive_speaker, proactive_speed)
-        
-        if wav:
-            b64 = base64.b64encode(wav).decode()
-            for ws in phone_ws:
-                await safe_send_json(ws, {"type": "audio_chunk", "audio_b64": b64, "mime_type": "audio/mpeg" if is_edge else "audio/wav"})
-    
-    for ws in phone_ws: await safe_send_json(ws, {"type": "audio_end"})
+    async with _tts_stream_lock:
+        sents = split_sentences(text)
+        for ws in phone_ws:
+            await safe_send_json(ws, {"type": "tts_start", "total": len(sents)})
+
+        proactive_speaker = str(get("proactive_vi_speaker", "NF")).strip() or "NF"
+        proactive_speed   = float(get("proactive_vi_speed", 1.0))
+        for i, s in enumerate(sents):
+            # force_lang="vi": nhắc nhở luôn là tiếng Việt, tránh detect_language sai
+            wav, is_edge = await synthesize_tts_by_language(
+                s, proactive_speaker, proactive_speed, force_lang="vi"
+            )
+            # Tránh mất câu khi strict mode trả về audio rỗng.
+            if not wav and bool(get("tts_strict_language_engine", True)):
+                log.warning(f"[Proactive TTS] Empty audio in strict mode, retry non-strict (sent={i + 1}/{len(sents)})")
+                wav, is_edge = await synthesize_tts_by_language(
+                    s,
+                    proactive_speaker,
+                    proactive_speed,
+                    force_lang="vi",
+                    strict=False,
+                )
+            if wav:
+                b64 = base64.b64encode(wav).decode()
+                for ws in phone_ws:
+                    await safe_send_json(
+                        ws,
+                        {"type": "audio_chunk", "audio_b64": b64,
+                         "mime_type": "audio/mpeg" if is_edge else "audio/wav"},
+                    )
+            else:
+                log.warning(f"[Proactive TTS] Skip sentence because audio is still empty (sent={i + 1}/{len(sents)})")
+
+        for ws in phone_ws:
+            await safe_send_json(ws, {"type": "audio_end"})
 
 # ── PentaKuruV4 Health & Sync Helper Functions ────────────────────────────
 
@@ -1835,11 +2677,20 @@ async def proactive_background_task():
                 msgs = [ai.time.format_reminder_message(r, "vi") for r in due]
                 await broadcast_proactive(" | ".join(msgs), ai)
 
-            # 1.5 Nhắc nghỉ sau mỗi 2 giờ làm việc liên tục
+            # 1.5 Nhắc nghỉ sau mỗi 2 giờ làm việc liên tục + phát nhạc ngẫu nhiên
             interval = float(get("proactive_break_remind_interval_sec", 7200))
             if _work_session_start_ts and (now_ts - _work_session_start_ts) >= interval:
                 if (now_ts - _last_break_remind_ts) >= interval:
-                    remind_text = "Anh làm liên tục 2 tiếng rồi đó. Nghỉ mắt, uống nước và giãn cơ 3-5 phút nha."
+                    # Chọn nhạc từ music/ (không ưu tiên chill, phát bất kỳ)
+                    song_name = _play_music_subfolder("")
+                    if song_name:
+                        remind_text = (
+                            f"Anh làm liên tục 2 tiếng rồi đó. "
+                            f"Nghỉ mắt, uống nước và giãn cơ 3-5 phút nha. "
+                            f"Em bật nhạc cho anh thư giãn: {song_name}"
+                        )
+                    else:
+                        remind_text = "Anh làm liên tục 2 tiếng rồi đó. Nghỉ mắt, uống nước và giãn cơ 3-5 phút nha."
                     await broadcast_proactive(remind_text, ai)
                     _last_break_remind_ts = now_ts
 
@@ -1883,7 +2734,7 @@ async def safe_send_json(ws, data):
 
 @app.websocket("/ws/chat")
 async def ws_chat(ws: WebSocket):
-    global _last_user_interaction_ts, _work_session_start_ts
+    global _last_user_interaction_ts, _work_session_start_ts, _session_lang
     await ws.accept()
     # ── Token auth (critical: check before any data is processed) ────────────
     _ws_token = ws.query_params.get("token", "")
@@ -1929,7 +2780,7 @@ async def ws_chat(ws: WebSocket):
             if raw.get("source") == "phone" and not _active_ws_meta[ws]["is_phone"]:
                 _active_ws_meta[ws]["is_phone"] = True
 
-            speed = float(raw.get("speed", 1.0)); speaker = raw.get("speaker", "NF"); use_tts = raw.get("tts", True)
+            speed = float(raw.get("speed", 1.0)); speaker = raw.get("speaker") or str(get("chat_speaker", "NF")).strip() or "NF"; use_tts = raw.get("tts", True)
             mode = raw.get("mode", "chat")
 
             # ── Backpressure guard ───────────────────────────────────────────
@@ -1947,21 +2798,55 @@ async def ws_chat(ws: WebSocket):
             t0 = time.perf_counter()
             resp_text = ""
             pipeline = "unknown"
+            _suppress_immediate_reply = False
+            _wiki_related: List[str] = []
 
             try:
                 if mode == "cmd":
                     log.info(f"🛠️ [Mode: Cmd] Processing: {text}")
                     if not looks_like_command(text):
-                        resp_text = (
-                            "Đang ở chế độ lệnh. Câu này không giống lệnh hệ thống. "
-                            "Anh/chị có thể chuyển sang CHAT để trao đổi, hoặc dùng dạng ngắn như 'mở ...', 'tìm ...', 'chạy ...'."
-                        )
+                        resp_text = random.choice(_CMD_NOTLIKE_POOL)
                         pipeline = "cmd_brief"
                     else:
-                        from ollama_command import get_default_interpreter
+                        from API_local.ollama_command import get_default_interpreter
                         interp = get_default_interpreter()
-                        cmd_res = interp.interpret(text)
-                        
+
+                        _ai_prn  = getattr(getattr(ai, "profile", None), "ai_pronoun", "em")
+                        _usr_prn = getattr(getattr(ai, "profile", None), "user_call", "") or \
+                                   getattr(getattr(ai, "profile", None), "pronoun", "anh")
+
+                        # Thiết lập callback thông báo khi Bonsai được kích hoạt
+                        _loop = asyncio.get_event_loop()
+                        def _on_bonsai_upgrade():
+                            coro = safe_send_json(ws, {
+                                "type": "response",
+                                "text": f"{_ai_prn.capitalize()} đang dùng suy luận nâng cao (Bonsai) để phân tích lệnh này, chờ {_ai_prn} một chút nhé...",
+                                "ai_latency_ms": 0,
+                                "pipeline": "cmd_bonsai_thinking",
+                            })
+                            asyncio.run_coroutine_threadsafe(coro, _loop)
+                        interp.bonsai_notify_cb = _on_bonsai_upgrade
+
+                        # Gửi xác nhận nhận lệnh trước khi chạy
+                        _ack_tmpl = random.choice(_CMD_RECEIVED_POOL)
+                        _ack_text = _ack_tmpl.format(
+                            prn=_ai_prn,
+                            prn_cap=_ai_prn.capitalize(),
+                            usr=_usr_prn,
+                        )
+                        await safe_send_json(ws, {
+                            "type": "response",
+                            "text": _ack_text,
+                            "ai_latency_ms": 0,
+                            "pipeline": "cmd_received",
+                        })
+
+                        # Chạy interpret trong executor để không chặn event loop
+                        cmd_res = await asyncio.get_event_loop().run_in_executor(
+                            None, interp.interpret, text
+                        )
+                        interp.bonsai_notify_cb = None  # Dọn callback sau khi dùng
+
                         # ── Track successful commands for Kuru sync ──────────────
                         if cmd_res.get("action") and not cmd_res.get("error"):
                             _recent_successful_commands.append({
@@ -1971,28 +2856,118 @@ async def ws_chat(ws: WebSocket):
                             })
                             if len(_recent_successful_commands) > 100:
                                 _recent_successful_commands.pop(0)
-                        
+
                         payload = _map_ollama_to_windows_payload(cmd_res)
-                        if payload["cmd"] or payload["script"]:
-                            win_res = await send_to_windows(cmd=payload["cmd"], script=payload["script"])
-                            what = payload["script"][:40] + "..." if payload["script"] else payload["cmd"]
-                            resp_text = f"Đã gửi lệnh Windows: {what}."
+                        _deferred_play_payload = None  # reset mỗi lượt
+                        _local_play_sub = payload.get("_local_play", "")
+                        if payload["cmd"] or payload["script"] or _local_play_sub:
+                            if _local_play_sub:
+                                # Phát nhạc nội bộ (Mac) — hoãn sang sau TTS để không đè nhau
+                                _deferred_play_payload = {"_local_play": _local_play_sub}
+                                win_res = {"ok": True, "deferred": True}
+                            elif bool(payload.get("_is_play")):
+                                # Legacy: Windows play hoãn
+                                _deferred_play_payload = payload
+                                win_res = {"ok": True, "deferred": True}
+                            else:
+                                win_res = await send_to_windows(cmd=payload["cmd"], script=payload["script"])
+                            # Dùng câu xác nhận tự nhiên thay vì đọc URL/path thô
+                            resp_text = _build_cmd_ack_text(cmd_res, _ai_prn, _usr_prn)
                             if not win_res.get("ok"):
-                                resp_text += f" (Lỗi: {win_res.get('error')})"
+                                _err_hint = str(win_res.get("error", ""))
+                                if "chưa được cấu hình" in _err_hint or "pc_tailscale_ip" in _err_hint:
+                                    resp_text = (
+                                        f"PC chưa được cấu hình {_ai_prn} ơi. "
+                                        f"{_ai_prn.capitalize()} cần đặt địa chỉ IP Windows trong ⚙ System → pc_tailscale_ip nhé!"
+                                    )
+                                else:
+                                    resp_text = random.choice(_CMD_WIN_FAIL_POOL)
                             pipeline = "cmd_ollama"
                         else:
+                            _deferred_play_payload = None
                             action_hint = str(cmd_res.get("action", "")).strip()
-                            if action_hint:
-                                resp_text = f"Em hiểu ý là '{action_hint}' nhưng lệnh này chưa thực thi được."
+                            _cmd_err   = str(cmd_res.get("error", "")).lower()
+                            if "ollama" in _cmd_err or "timeout" in _cmd_err or "không phản hồi" in _cmd_err:
+                                resp_text = (
+                                    f"{_ai_prn.capitalize()} không diễn giải được lệnh vì Ollama đang offline. "
+                                    f"{_usr_prn} kiểm tra Ollama chạy chưa rồi thử lại nhé!"
+                                )
+                            elif action_hint:
+                                resp_text = random.choice(_CMD_CANT_EXEC_POOL)
                             else:
-                                resp_text = "Lệnh chưa rõ hoặc chưa hỗ trợ. Em có thể trả lời nhanh ở chế độ CHAT."
+                                resp_text = random.choice(_CMD_NOTLIKE_POOL)
                             pipeline = "cmd_brief"
                 else:
+                    _deferred_play_payload = None
                     promise_reply = _handle_promise_user_message(text, now_ts)
                     if promise_reply:
                         resp_text = promise_reply
                         pipeline = "chat_promise"
                         pass
+
+                    # ── Skill dispatch ────────────────────────────────────────
+                    if pipeline == "unknown" and _SKILL_MANAGER:
+                        _sk_ctx = {
+                            "lang":       _session_lang,
+                            "ai_pronoun": getattr(getattr(ai, "profile", None), "ai_pronoun", "em"),
+                            "user_call":  (
+                                getattr(getattr(ai, "profile", None), "user_call", "")
+                                or getattr(getattr(ai, "profile", None), "pronoun", "anh")
+                            ),
+                        }
+                        _sk_res = _SKILL_MANAGER.dispatch(text, context=_sk_ctx)
+                        if _sk_res:
+                            resp_text = _sk_res["response"]
+                            pipeline  = _sk_res.get("pipeline", "skill")
+                            _meta = _sk_res.get("meta", {}) if isinstance(_sk_res, dict) else {}
+                            _action = str(_meta.get("action", "")).strip().lower()
+                            _detail = _meta.get("action_detail", {}) if isinstance(_meta, dict) else {}
+
+                            # Execute side-effects for Gmail notification skill.
+                            if _action == "enable":
+                                cfg = get_full_config()
+                                cfg["gmail_notification_enabled"] = True
+                                save_config(cfg)
+                            elif _action == "disable":
+                                cfg = get_full_config()
+                                cfg["gmail_notification_enabled"] = False
+                                save_config(cfg)
+                            elif _action == "check":
+                                if _gmail_daemon:
+                                    _q = _gmail_daemon.get_queue()
+                                    if _q:
+                                        _count = len(_q)
+                                        _first = _q[0]
+                                        _nick = _first.get("nickname", "người gửi")
+                                        _subj = _first.get("subject", "(không tiêu đề)")
+                                        resp_text = (
+                                            f"Anh đang có {_count} email chờ xử lý. "
+                                            f"Email đầu tiên từ {_nick}: {_subj}. "
+                                            "Anh muốn em đọc ngay không?"
+                                        )
+                                    else:
+                                        resp_text = "Hiện chưa có email nào trong hàng đợi Gmail notification."
+                                else:
+                                    resp_text = "Gmail notification daemon chưa sẵn sàng."
+                            elif _action == "response":
+                                if _gmail_daemon:
+                                    _resp = str(_detail.get("user_response", "")).lower()
+                                    _ok = _gmail_daemon.set_user_response("", _resp)
+                                    if not _ok:
+                                        resp_text = "Hiện chưa có thông báo email nào đang chờ xác nhận để em xử lý."
+                                    else:
+                                        # Với YES: daemon sẽ broadcast nội dung mail ngay,
+                                        # nên bỏ câu trả lời trung gian để tránh cảm giác 2 câu chồng nhau.
+                                        if _resp in {"yes", "có", "1", "true"}:
+                                            _suppress_immediate_reply = True
+                                else:
+                                    resp_text = "Gmail notification daemon chưa sẵn sàng."
+                            elif _action == "clear":
+                                if _gmail_daemon:
+                                    _n = _gmail_daemon.clear_queue()
+                                    resp_text = f"Em đã xóa {_n} thông báo Gmail khỏi hàng đợi."
+                                else:
+                                    resp_text = "Gmail notification daemon chưa sẵn sàng."
 
                     s_state = _schedule_setup_state.setdefault(ws, {"active": False, "draft": empty_week_schedule(), "off_topic_hits": 0, "has_draft": False})
 
@@ -2088,37 +3063,208 @@ async def ws_chat(ws: WebSocket):
                             resp_text = schedule_week_answer(schedule_data)
                             pipeline = "chat_schedule_query_week"
                         elif is_schedule_setup_trigger(text):
-                            import random
                             s_state["active"] = True
                             s_state["draft"] = _load_week_schedule()
                             s_state["has_draft"] = True
                             s_state["off_topic_hits"] = 0
                             resp_text = random.choice(_SCHEDULE_PROMPTS) + " Khi xong anh nói 'được rồi em' để em lưu."
                             pipeline = "chat_schedule_prompt"
+
+                        # ── PentaWiki toggle ────────────────────────────────────
+                        elif _WIKI_AVAILABLE and _wiki_check_toggle(text):
+                            global _penta_wiki_mode
+                            _wiki_action = _wiki_check_toggle(text)
+                            _ai_prn_wt   = getattr(getattr(ai, "profile", None), "ai_pronoun", "em")
+                            _usr_prn_wt  = getattr(getattr(ai, "profile", None), "user_call", "") or \
+                                           getattr(getattr(ai, "profile", None), "pronoun", "anh")
+                            _lang_labels = {"vi": "tiếng Việt", "en": "tiếng Anh", "ja": "tiếng Nhật"}
+                            if _wiki_action == "on":
+                                _penta_wiki_mode = True
+                                _save_penta_state()
+                                _ll = _lang_labels.get(_session_lang, "tiếng Việt")
+                                resp_text = (
+                                    f"{_ai_prn_wt.capitalize()} đã bật PentaWiki rồi nha {_usr_prn_wt}! "
+                                    f"{_ai_prn_wt.capitalize()} sẽ dùng Wikipedia ({_ll}) để tra cứu cho {_usr_prn_wt} đó. "
+                                    f"{_usr_prn_wt} hỏi gì {_ai_prn_wt} tra ngay nhé!"
+                                )
+                            else:
+                                _penta_wiki_mode = False
+                                _save_penta_state()
+                                resp_text = (
+                                    f"PentaWiki đã tắt rồi nha {_usr_prn_wt}! "
+                                    f"{_ai_prn_wt.capitalize()} quay về chế độ chat thường nhé."
+                                )
+                            pipeline = "wiki_toggle"
+
+                        # ── Language toggle ─────────────────────────────────────
+                        elif _lang_check_toggle(text):
+                            _new_lang    = _lang_check_toggle(text)
+                            _ai_prn_lt   = getattr(getattr(ai, "profile", None), "ai_pronoun", "em")
+                            _usr_prn_lt  = getattr(getattr(ai, "profile", None), "user_call", "") or \
+                                           getattr(getattr(ai, "profile", None), "pronoun", "anh")
+                            _session_lang = _new_lang
+                            _save_penta_state()
+                            _lang_confirms = {
+                                "vi": f"{_ai_prn_lt.capitalize()} chuyển về tiếng Việt rồi nha {_usr_prn_lt}! Mình nói chuyện tiếng Việt thôi nhé.",
+                                "en": f"Switched to English mode! I'll reply in English from now on, {_usr_prn_lt}. Feel free to chat!",
+                                "ja": f"日本語モードに切り替えました！これからは日本語でお答えしますよ、{_usr_prn_lt}さん。どうぞよろしくお願いします！",
+                            }
+                            resp_text = _lang_confirms.get(_new_lang, _lang_confirms["vi"])
+                            pipeline = "lang_toggle"
+
+                        # ── PentaWiki query ─────────────────────────────────────
+                        elif _penta_wiki_mode and _WIKI_AVAILABLE and _wiki_is_query(text):
+                            _ai_prn_wq  = getattr(getattr(ai, "profile", None), "ai_pronoun", "em")
+                            _usr_prn_wq = getattr(getattr(ai, "profile", None), "user_call", "") or \
+                                          getattr(getattr(ai, "profile", None), "pronoun", "anh")
+                            # Thông báo đang tra cứu
+                            _seek_msgs = {
+                                "vi": f"{_ai_prn_wq.capitalize()} đang tra sách, {_usr_prn_wq} đợi {_ai_prn_wq} nhé...",
+                                "en": f"Let me look that up for you, {_usr_prn_wq}...",
+                                "ja": f"調べていますので、少々お待ちください...",
+                            }
+                            await safe_send_json(ws, {
+                                "type": "response",
+                                "text": _seek_msgs.get(_session_lang, _seek_msgs["vi"]),
+                                "ai_latency_ms": 0,
+                                "pipeline": "wiki_searching",
+                            })
+                            _wiki_ollama_url   = get("ollama_url", "http://localhost:11434")
+                            _wiki_ollama_model = get("ollama_local_schedule_model", "llama3.2:1b")
+                            _wiki_res  = await asyncio.get_event_loop().run_in_executor(
+                                None, lambda: _wiki_fetch(
+                                    text, _session_lang,
+                                    _wiki_ollama_url, _wiki_ollama_model
+                                )
+                            )
+                            resp_text = _wiki_format(_wiki_res, _session_lang, _ai_prn_wq, _usr_prn_wq)
+                            # Nếu không tìm thấy → dùng thông báo không found, KHÔNG fallback ai.chat
+                            pipeline = "wiki_result"
+                            # Gắn danh sách chủ đề liên quan vào pipeline tag để WS gửi xuống client
+                            _wiki_related = _wiki_res.get("related", []) if _wiki_res.get("ok") else []
+
+                        # ── PentaMi mode ───────────────────────────────────────
+                        elif _PENTAMI_AVAILABLE and _pentami_check_toggle(text):
+                            toggle_action = _pentami_check_toggle(text)
+                            global _pentami_mode
+                            pm = get_pentami_chat()
+                            _ai_pronoun = getattr(getattr(ai, "profile", None), "ai_pronoun", "em")
+                            _user_call  = getattr(getattr(ai, "profile", None), "user_call", "") or \
+                                          getattr(getattr(ai, "profile", None), "pronoun", "anh")
+                            if toggle_action == "on":
+                                _pentami_mode = True
+                                # Keepalive: không để Bonsai ngủ khi đang dùng PentaMi
+                                pm._bonsai.set_keepalive(True)
+                                # Đăng ký callback thông báo khi Bonsai vào sleep
+                                def _bonsai_sleep_notify(msg: str):
+                                    asyncio.run_coroutine_threadsafe(
+                                        broadcast_proactive(msg, init_ai()),
+                                        asyncio.get_event_loop(),
+                                    )
+                                pm._bonsai.set_sleep_notify(_bonsai_sleep_notify)
+                                # Pre-warm Bonsai ngầm trong background
+                                async def _prewarm():
+                                    loop = asyncio.get_event_loop()
+                                    ready = await loop.run_in_executor(
+                                        None, pm._bonsai._ensure_awake
+                                    )
+                                    if not ready:
+                                        log.warning("[PentaMi] Pre-warm Bonsai thất bại")
+                                asyncio.create_task(_prewarm())
+                                resp_text = (
+                                    f"Chế độ PentaMi đã bật rồi nha {_user_call}! "
+                                    f"{_ai_pronoun.capitalize()} đây, "
+                                    f"{_user_call} muốn tâm sự gì không nào?"
+                                )
+                            elif toggle_action == "off":
+                                _pentami_mode = False
+                                pm._bonsai.set_keepalive(False)
+                                pm._bonsai.set_sleep_notify(None)
+                                # Xoá context hội thoại khi tắt, giữ lại kiến thức đã học
+                                pm.clear_context()
+                                resp_text = (
+                                    f"Chế độ PentaMi đã tắt nha {_user_call}. "
+                                    f"{_ai_pronoun.capitalize()} đã lưu lại những gì đã học, "
+                                    f"nhưng lịch sử trò chuyện thì đã xoá rồi nhé."
+                                )
+                            elif toggle_action == "clear":
+                                pm.clear_context()
+                                resp_text = (
+                                    f"Xoá xong rồi ó! {_ai_pronoun.capitalize()} và "
+                                    f"{_user_call} bắt đầu lại từ đầu nhé."
+                                )
+                            pipeline = "pentami_toggle"
+
+                        elif _pentami_mode and _PENTAMI_AVAILABLE:
+                            # PentaMi chat mode: dùng Bonsai-8B qua pentami_chat
+                            pm = get_pentami_chat()
+                            _ai_p = getattr(getattr(ai, "profile", None), "ai_pronoun", "em")
+                            _u_p  = getattr(getattr(ai, "profile", None), "user_call", "") or \
+                                    getattr(getattr(ai, "profile", None), "pronoun", "anh")
+                            await safe_send_json(ws, {
+                                "type": "response",
+                                "text": f"{_ai_p.capitalize()} đang nghĩ câu trả lời cho {_u_p}, chờ {_ai_p} chút nha...",
+                                "ai_latency_ms": 0,
+                                "emotional_state": "normal",
+                                "hormone_levels": {},
+                                "pipeline": "pentami_thinking",
+                            })
+                            # Nếu Bonsai đang khởi động (chưa ready), báo người dùng trước
+                            if not pm._bonsai.is_available():
+                                await safe_send_json(ws, {
+                                    "type": "response",
+                                    "text": f"{_ai_p.capitalize()} đang thức dậy, {_ai_p} cần chút để khởi động GPU né, {_ai_p} sẽ trả lời ngay sau đó nhé...",
+                                    "ai_latency_ms": 0,
+                                    "emotional_state": "normal",
+                                    "hormone_levels": {},
+                                    "pipeline": "pentami_waking",
+                                })
+                            try:
+                                resp_text = await asyncio.wait_for(
+                                    asyncio.get_event_loop().run_in_executor(None, pm.chat, text),
+                                    timeout=55.0,
+                                )
+                            except asyncio.TimeoutError:
+                                resp_text = (
+                                    f"{_ai_p.capitalize()} xin lỗi {_u_p}, "
+                                    f"{_ai_p} suy nghĩ lâu quá mà chưa kịp — {_u_p} thử lại sau nhé!"
+                                )
+                            pipeline = "pentami_bonsai"
+
                         else:
                             proactive_followup = await _maybe_reply_contextual_care(text, ai, now_ts)
                             if proactive_followup:
                                 resp_text = proactive_followup
                                 pipeline = "chat_proactive_followup"
                             else:
-                                # Chat mode: mặc định không dùng LLM fallback, chỉ bật khi config cho phép.
-                                if hasattr(ai, "enable_chat_llm_fallback"):
-                                    ai.enable_chat_llm_fallback = bool(get("chat_use_llm_fallback", False))
-                                resp_text = await asyncio.get_event_loop().run_in_executor(None, ai.chat, text)
-                                cleaned_text, has_show_schedule = parse_show_schedule_token(resp_text)
-                                if has_show_schedule:
-                                    schedule_data = _load_week_schedule()
-                                    detail = schedule_week_answer(schedule_data)
-                                    resp_text = f"{cleaned_text} {detail}".strip()
-                                    pipeline = "chat_schedule_query_token"
-                                run_match = re.search(r'<RUN>(.*?)</RUN>', resp_text, re.IGNORECASE|re.DOTALL)
-                                if run_match:
-                                    resp_text = re.sub(r'<RUN>.*?</RUN>', '', resp_text, flags=re.IGNORECASE|re.DOTALL).strip()
-                                if pipeline == "unknown":
-                                    pipeline = "chat_core_llm" if bool(get("chat_use_llm_fallback", False)) else "chat_core"
+                                # Nếu đang ở chế độ ngôn ngữ khác tiếng Việt → dùng Ollama
+                                if _session_lang != "vi":
+                                    _lang_resp = await _chat_in_lang_async(text, _session_lang, ai)
+                                    if _lang_resp:
+                                        resp_text = _lang_resp
+                                        pipeline  = f"chat_lang_{_session_lang}"
+                                if not resp_text:
+                                    # Chat mode: mặc định không dùng LLM fallback, chỉ bật khi config cho phép.
+                                    if hasattr(ai, "enable_chat_llm_fallback"):
+                                        ai.enable_chat_llm_fallback = bool(get("chat_use_llm_fallback", False))
+                                    resp_text = await asyncio.get_event_loop().run_in_executor(None, ai.chat, text)
+                                    cleaned_text, has_show_schedule = parse_show_schedule_token(resp_text)
+                                    if has_show_schedule:
+                                        schedule_data = _load_week_schedule()
+                                        detail = schedule_week_answer(schedule_data)
+                                        resp_text = f"{cleaned_text} {detail}".strip()
+                                        pipeline = "chat_schedule_query_token"
+                                    run_match = re.search(r'<RUN>(.*?)</RUN>', resp_text, re.IGNORECASE|re.DOTALL)
+                                    if run_match:
+                                        resp_text = re.sub(r'<RUN>.*?</RUN>', '', resp_text, flags=re.IGNORECASE|re.DOTALL).strip()
+                                    if pipeline == "unknown":
+                                        pipeline = "chat_core_llm" if bool(get("chat_use_llm_fallback", False)) else "chat_core"
             finally:
                 if _sem_acquired:
                     _ai_semaphore.release()
+
+            if _suppress_immediate_reply:
+                continue
 
             if not resp_text:
                 resp_text = "Dạ, em xong rồi ạ."
@@ -2127,6 +3273,9 @@ async def ws_chat(ws: WebSocket):
 
             em = ai.emotion.hormone.get_emotional_state() if hasattr(ai, 'emotion') else "normal"
             hl = ai.emotion.hormone.get() if hasattr(ai, 'emotion') else {}
+            _ws_extra: dict = {}
+            if pipeline == "wiki_result" and _wiki_related:
+                _ws_extra["wiki_suggestions"] = _wiki_related
             await safe_send_json(ws, {
                 "type": "response",
                 "text": resp_text,
@@ -2135,19 +3284,59 @@ async def ws_chat(ws: WebSocket):
                 "hormone_levels": hl,
                 "mode_used": mode,
                 "pipeline": pipeline,
+                **_ws_extra,
             })
-            
+
             if use_tts:
-                sents = split_sentences(resp_text)
-                await safe_send_json(ws, {"type": "tts_start", "total": len(sents)})
-                for i, s in enumerate(sents):
-                    wav, is_edge = await synthesize_tts_by_language(s, speaker, speed)
-                    if wav:
-                        await safe_send_json(ws, {
-                            "type": "audio_chunk", "audio_b64": base64.b64encode(wav).decode(),
-                            "mime_type": "audio/mpeg" if is_edge else "audio/wav"
-                        })
-                await safe_send_json(ws, {"type": "audio_end"})
+                async with _tts_stream_lock:
+                    # Strip URLs trước khi đọc TTS (URL không đọc được tự nhiên)
+                    _tts_text = re.sub(r'https?://\S+', '', resp_text).strip()
+                    sents = split_sentences(_tts_text)
+                    await safe_send_json(ws, {"type": "tts_start", "total": len(sents)})
+                    for i, s in enumerate(sents):
+                        # TTS force_lang: ưu tiên theo pipeline → session language → auto-detect
+                        if pipeline.startswith("pentami"):
+                            fl = "vi"                          # PentaMi luôn tiếng Việt
+                        elif pipeline in ("wiki_result", "lang_toggle") or pipeline.startswith("chat_lang_"):
+                            fl = _session_lang                 # Wiki / lang mode → đúng ngôn ngữ
+                        elif _session_lang != "vi":
+                            fl = _session_lang                 # Toàn bộ phiên đang dùng ngôn ngữ khác
+                        else:
+                            fl = None                          # Auto-detect (default)
+                        wav, is_edge = await synthesize_tts_by_language(s, speaker, speed, force_lang=fl)
+                        # Nếu strict mode trả audio rỗng, retry non-strict để tránh mất nửa câu.
+                        if not wav and bool(get("tts_strict_language_engine", True)):
+                            log.warning(f"[TTS] Empty audio in strict mode, retry non-strict (sent={i + 1}/{len(sents)})")
+                            wav, is_edge = await synthesize_tts_by_language(
+                                s,
+                                speaker,
+                                speed,
+                                force_lang=fl,
+                                strict=False,
+                            )
+                        if wav:
+                            await safe_send_json(ws, {
+                                "type": "audio_chunk", "audio_b64": base64.b64encode(wav).decode(),
+                                "mime_type": "audio/mpeg" if is_edge else "audio/wav"
+                            })
+                        else:
+                            log.warning(f"[TTS] Skip sentence because audio is still empty (sent={i + 1}/{len(sents)})")
+                    await safe_send_json(ws, {"type": "audio_end"})
+                # Thực thi lệnh nhạc đã hoãn — sau khi TTS xong mới phát
+                try:
+                    if _deferred_play_payload:
+                        _local_sub = _deferred_play_payload.get("_local_play")
+                        if _local_sub:
+                            # Phát nhạc nội bộ từ music/<subfolder>/
+                            _play_music_subfolder(_local_sub)
+                        elif _deferred_play_payload.get("cmd") or _deferred_play_payload.get("script"):
+                            await send_to_windows(
+                                cmd=_deferred_play_payload.get("cmd", ""),
+                                script=_deferred_play_payload.get("script", ""),
+                            )
+                        _deferred_play_payload = None  # xóa sau khi dùng
+                except NameError:
+                    pass
     except WebSocketDisconnect:
         log.info(f"❌ WS Disconnected: {client_addr}")
     except Exception as e:

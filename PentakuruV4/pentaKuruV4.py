@@ -3,7 +3,7 @@
 # ║   PentaKuRu Radial Launcher  ·  Remote PowerShell via Tailscale            ║
 # ║   v4.2 — Flask server · PSExecutor · TailscaleManager                      ║
 # ║         File Search (ZIP/PDF/Folder) · MB4/MB5/MB6 · Tray icon            ║
-# ║         Auto-hide on outside click  · No Cloudflare dependency             ║
+# ║         Auto-hide on outside click  · Remote server via Tailscale/LAN      ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 import sys
@@ -287,20 +287,6 @@ class DataManager(QObject):
         return cls._instance
 
     @staticmethod
-    def clean_cloudflare_token(token: str) -> str:
-        """
-        Automatically remove 'cloudflared.exe service install' prefix from corrupted tokens.
-        Extracts the JWT payload if user pasted the full command by mistake.
-        """
-        if not token:
-            return ""
-        token = str(token).strip()
-        # Remove the 'cloudflared.exe service install ' prefix if present
-        if token.startswith("cloudflared.exe service install "):
-            token = token.replace("cloudflared.exe service install ", "").strip()
-        return token
-
-    @staticmethod
     def _get_app_root() -> str:
         if getattr(sys, "frozen", False):
             return os.path.dirname(sys.executable)
@@ -336,6 +322,26 @@ class DataManager(QObject):
         self._load_hotkeys_file()
         self._load_urls()
         self._load_server_config()
+        # Sau khi load xong config (có ai_server_url), push sectors lần đầu
+        self._push_sectors_on_startup()
+
+    def _push_sectors_on_startup(self):
+        """Push toàn bộ sectors hiện có lên AI server sau khi khởi động xong."""
+        with self._lock:
+            if not self.sector_data:
+                return
+            snapshot = {
+                str(idx): {
+                    "exe_path":        s.exe_path,
+                    "icon_path":       s.icon_path,
+                    "url":             s.url,
+                    "name":            s.name,
+                    "use_incognito":   s.use_incognito,
+                    "enable_tracking": s.enable_tracking,
+                }
+                for idx, s in self.sector_data.items()
+            }
+        self._push_sectors_to_ai(snapshot)
 
     def _load_sectors(self):
         p = os.path.join(self.memory_dir, "sectors.json")
@@ -404,8 +410,44 @@ class DataManager(QObject):
             with open(p, "w", encoding="utf-8") as f:
                 json.dump(snapshot, f, indent=2, ensure_ascii=False)
             self.data_changed.emit()
+            # Push sectors lên AI server sau khi lưu thành công
+            self._push_sectors_to_ai(snapshot)
         except Exception as e:
             print(f"[DataManager] save sectors: {e}")
+
+    def _push_sectors_to_ai(self, snapshot: dict):
+        """
+        Gửi toàn bộ sectors lên AI server qua HTTP (POST /api/kuru/sectors).
+        Chạy trong background thread để không block UI.
+        Bỏ qua nếu ai_server_url chưa được cấu hình.
+        """
+        ai_url   = self.server_config.get("ai_server_url", "").strip()
+        ai_token = self.server_config.get("ai_server_token", "").strip()
+        if not ai_url or not ai_token:
+            return  # chưa cấu hình → bỏ qua
+
+        def _do_push():
+            try:
+                import urllib.request
+                import urllib.error
+                body = json.dumps({"sectors": snapshot}, ensure_ascii=False).encode("utf-8")
+                endpoint = ai_url.rstrip("/") + "/api/kuru/sectors"
+                req = urllib.request.Request(
+                    endpoint,
+                    data=body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {ai_token}",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    resp = json.loads(r.read().decode())
+                    print(f"[KuruPush] AI server nhận {resp.get('received', '?')} sectors ✓")
+            except Exception as e:
+                print(f"[KuruPush] Không thể gửi sectors lên AI server: {e}")
+
+        threading.Thread(target=_do_push, daemon=True, name="KuruSectorPush").start()
 
     def save_config(self):
         p = os.path.join(self.memory_dir, "config.json")
@@ -453,16 +495,9 @@ class DataManager(QObject):
             # full: mở toàn bộ thực thi PowerShell qua /run
             # demo_safe: bật whitelist demo để chặn lệnh nguy hiểm
             self.server_config["execution_mode"] = "full"
-            self.server_config["use_tailscale"] = True
-            self.server_config["allow_lan"] = False
-            self.server_config["prefer_tailscale"] = True
-            self.server_config["use_cloudflare"] = True
-            self.server_config["cloudflare_tunnel_name"] = "PentaKuRuv4"
-            self.server_config["cloudflare_tunnel_id"] = "86c8277e-6f2b-45e1-ba96-696297a5bd09"
-            self.server_config["cloudflare_token"] = ""
-            self.server_config["cloudflare_route_hostname"] = "pentakuV3"
-            self.server_config["cloudflare_route_path"] = ".*"
-            self.server_config["cloudflare_service_url"] = "http://localhost:7777"
+            self.server_config["use_tailscale"] = False
+            self.server_config["allow_lan"] = True
+            self.server_config["prefer_tailscale"] = False
             self.server_config["controller_mode"] = "default_server_only"
             self.server_config["default_controller"] = "penta_ai"
             self.server_config["allow_teamviewer_control"] = True
@@ -478,19 +513,24 @@ class DataManager(QObject):
         self.server_config.setdefault("use_tailscale", False)      # First-time: use LAN
         self.server_config.setdefault("allow_lan", True)           # First-time default: LAN enabled
         self.server_config.setdefault("prefer_tailscale", False)
-        self.server_config.setdefault("use_cloudflare", False)     # First-time: LAN only
-        self.server_config.setdefault("cloudflare_tunnel_name", "PentaKuRuv4")
-        self.server_config.setdefault("cloudflare_tunnel_id", "86c8277e-6f2b-45e1-ba96-696297a5bd09")
-        # Default token with full command (will be cleaned automatically)
-        self.server_config.setdefault("cloudflare_token", 
-            "cloudflared.exe service install eyJhIjoiYTg3NmVlZWRiYTIyZDQzYmE4MTI3OGM0M2Y5NzFhYzciLCJ0IjoiODZjODI3N2UtNmYyYi00NWUxLWJhOTYtNjk2Mjk3YTViZDA5IiwicyI6Ill6WTRNemd5TkRjdFpUYzNNeTAwWTJZeExXSmhaV1l0TVRFM056SmhNR1F4TlRrMyJ9"
-        )
-        self.server_config.setdefault("cloudflare_route_hostname", "pentakuV3")
-        self.server_config.setdefault("cloudflare_route_path", ".*")
-        self.server_config.setdefault("cloudflare_service_url", "http://localhost:7777")
         self.server_config.setdefault("controller_mode", "default_server_only")
         self.server_config.setdefault("default_controller", "penta_ai")
         self.server_config.setdefault("allow_teamviewer_control", True)
+        # Địa chỉ AI server (Mac/PC chạy PentaAI) để PentaKuRu push sectors
+        self.server_config.setdefault("ai_server_url",   "")  # vd: http://100.x.x.x:9090
+        self.server_config.setdefault("ai_server_token", "")  # Bearer token của AI server
+
+        # Remove legacy Cloudflare keys from older configs.
+        for legacy_key in (
+            "use_cloudflare",
+            "cloudflare_tunnel_name",
+            "cloudflare_tunnel_id",
+            "cloudflare_token",
+            "cloudflare_route_hostname",
+            "cloudflare_route_path",
+            "cloudflare_service_url",
+        ):
+            self.server_config.pop(legacy_key, None)
 
     @staticmethod
     def _load_bundle_config() -> dict:
@@ -825,7 +865,7 @@ class PSExecutor:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  FLASK SERVER THREAD  — HTTP server nhận lệnh từ Cloudflare
+#  FLASK SERVER THREAD  — HTTP server nhận lệnh từ remote client
 # ══════════════════════════════════════════════════════════════════════════════
 
 class FlaskServerThread(QThread):
@@ -919,14 +959,8 @@ class FlaskServerThread(QThread):
         watermark   = dcfg.get("demo_watermark", "")
         exec_mode   = dcfg.get("execution_mode", "full")
         use_tailscale = bool(self.data_manager.server_config.get("use_tailscale", True))
-        use_cloudflare = bool(self.data_manager.server_config.get("use_cloudflare", False))
         allow_lan = bool(self.data_manager.server_config.get("allow_lan", False))
         prefer_tailscale = bool(self.data_manager.server_config.get("prefer_tailscale", True))
-        cloudflare_tunnel_name = str(self.data_manager.server_config.get("cloudflare_tunnel_name", ""))
-        cloudflare_tunnel_id = str(self.data_manager.server_config.get("cloudflare_tunnel_id", ""))
-        cloudflare_route_hostname = str(self.data_manager.server_config.get("cloudflare_route_hostname", "pentakuV3"))
-        cloudflare_route_path = str(self.data_manager.server_config.get("cloudflare_route_path", ".*"))
-        cloudflare_service_url = str(self.data_manager.server_config.get("cloudflare_service_url", f"http://localhost:{self.data_manager.server_config.get('port', 7777)}"))
         controller_mode = str(self.data_manager.server_config.get("controller_mode", "default_server_only"))
         default_controller = str(self.data_manager.server_config.get("default_controller", "penta_ai"))
         allow_teamviewer = bool(self.data_manager.server_config.get("allow_teamviewer_control", True))
@@ -963,17 +997,11 @@ class FlaskServerThread(QThread):
                 "demo_mode": is_demo,
                 "execution_mode": exec_mode,
                 "use_tailscale": use_tailscale,
-                "use_cloudflare": use_cloudflare,
                 "allow_lan": allow_lan,
                 "prefer_tailscale": prefer_tailscale,
                 "controller_mode": controller_mode,
                 "default_controller": default_controller,
                 "lan_url": f"http://{lan_ip}:{port}" if allow_lan else "",
-                "cloudflare_tunnel_name": cloudflare_tunnel_name,
-                "cloudflare_tunnel_id": cloudflare_tunnel_id,
-                "cloudflare_route_hostname": cloudflare_route_hostname,
-                "cloudflare_route_path": cloudflare_route_path,
-                "cloudflare_service_url": cloudflare_service_url,
                 "teamviewer_control": allow_teamviewer,
                 "watermark": watermark,
             })
@@ -987,16 +1015,10 @@ class FlaskServerThread(QThread):
                 "supports": ["cmd", "script", "powershell", "install", "document", "gui_apps"] + (["teamviewer"] if allow_teamviewer else []),
                 "network": {
                     "use_tailscale": use_tailscale,
-                    "use_cloudflare": use_cloudflare,
                     "allow_lan": allow_lan,
                     "prefer_tailscale": prefer_tailscale,
                     "lan_url": f"http://{lan_ip}:{port}" if allow_lan else "",
                     "tailscale_ip": self.data_manager.server_config.get("tailscale_ip", ""),
-                    "cloudflare_tunnel_name": cloudflare_tunnel_name,
-                    "cloudflare_tunnel_id": cloudflare_tunnel_id,
-                    "cloudflare_route_hostname": cloudflare_route_hostname,
-                    "cloudflare_route_path": cloudflare_route_path,
-                    "cloudflare_service_url": cloudflare_service_url,
                 },
                 "controller_mode": controller_mode,
                 "default_controller": default_controller,
@@ -1126,72 +1148,6 @@ del "%~f0"
             QTimer.singleShot(1000, QApplication.instance().quit)
             return _jsonify({"ok": True, "msg": "App sẽ tự xoá trong 3 giây."})
 
-        # ── /health — Health check endpoint (Cloudflare integration) ──────────
-        @app.route("/health", methods=["GET"])
-        def health_check():
-            """Simple health check — no auth required, thường dùng cho monitoring."""
-            import psutil
-            try:
-                cpu = psutil.cpu_percent(interval=0.1)
-                mem = psutil.virtual_memory().percent
-            except:
-                cpu = mem = 0
-            return _jsonify({
-                "ok": True,
-                "status": "healthy",
-                "service": "PentaKuRu",
-                "app_version": "v4.2",
-                "execution_mode": exec_mode,
-                "cpu_usage": cpu,
-                "memory_usage": mem,
-                "cloudflare_enabled": use_cloudflare,
-                "timestamp": int(time.time())
-            })
-
-        # ── /api/sync_commands — Receive command history from AI server ──────
-        @app.route("/api/sync_commands", methods=["POST"])
-        def sync_commands():
-            """AI server gửi danh sách commands thành công để cập nhật whitelist."""
-            if not chk(_flask_req):
-                return _jsonify({"ok": False, "error": "Unauthorized"}), 401
-            
-            data = _flask_req.get_json(force=True, silent=True) or {}
-            commands = data.get("commands", [])
-            
-            if not isinstance(commands, list):
-                return _jsonify({"ok": False, "error": "Commands phải là list"}), 400
-            
-            # Lưu vào memory
-            if not hasattr(sync_commands, "recent_commands"):
-                sync_commands.recent_commands = []
-            
-            sync_commands.recent_commands = commands[-50:]  # giữ 50 commands gần nhất
-            
-            log_msg = f"Synced {len(commands)} commands from AI server"
-            _demo_log("sync_commands", log_msg)
-            
-            return _jsonify({
-                "ok": True,
-                "synced": len(commands),
-                "stored_count": len(sync_commands.recent_commands),
-                "timestamp": int(time.time())
-            })
-
-        # ── /api/recent_commands — Query danh sách commands gần đây ──────────
-        @app.route("/api/recent_commands", methods=["GET"])
-        def recent_commands():
-            """AI server lấy danh sách commands đã chạy thành công."""
-            if not chk(_flask_req):
-                return _jsonify({"ok": False, "error": "Unauthorized"}), 401
-            
-            cmds = getattr(sync_commands, "recent_commands", [])
-            return _jsonify({
-                "ok": True,
-                "commands": cmds,
-                "count": len(cmds),
-                "timestamp": int(time.time())
-            })
-
         return app
 
     # ── QThread.run ──────────────────────────────────────────────────────────
@@ -1229,7 +1185,7 @@ del "%~f0"
 
 class TailscaleManager(QObject):
     """
-    Tích hợp Tailscale thay thế Cloudflare Tunnel.
+    Tích hợp Tailscale cho remote access.
     • Tìm tailscale.exe (bundle, cạnh exe, hoặc PATH)
     • Lấy Tailscale IP của máy (100.x.x.x)
     • Không cần token tunnel — Tailscale tự xác thực qua mạng VPN của nó
@@ -1427,120 +1383,6 @@ class TailscaleManager(QObject):
 
     def get_ip(self) -> str:
         return self._tailscale_ip
-
-
-class CloudflareTunnelManager(QObject):
-    """Quản lý tiến trình cloudflared để bật/tắt Cloudflare Tunnel thật."""
-
-    status_changed = Signal(str)   # cf_running | cf_stopped | cf_no_exe | cf_no_token | cf_error:...
-
-    def __init__(self, data_manager: "DataManager", parent=None):
-        super().__init__(parent)
-        self.data_manager = data_manager
-        self._proc: Optional[subprocess.Popen] = None
-        self._running = False
-
-    @staticmethod
-    def find_exe() -> Optional[str]:
-        mei = getattr(sys, "_MEIPASS", None)
-        if mei:
-            p = os.path.join(mei, "cloudflared.exe")
-            if os.path.exists(p):
-                return p
-
-        base = (os.path.dirname(sys.executable)
-                if getattr(sys, "frozen", False)
-                else os.path.dirname(os.path.abspath(__file__)))
-        p = os.path.join(base, "cloudflared.exe")
-        if os.path.exists(p):
-            return p
-
-        for default in [
-            r"C:\Program Files\cloudflared\cloudflared.exe",
-            r"C:\Program Files (x86)\cloudflared\cloudflared.exe",
-        ]:
-            if os.path.exists(default):
-                return default
-
-        try:
-            r = subprocess.run(["where", "cloudflared"], capture_output=True, text=True, timeout=3)
-            if r.returncode == 0:
-                return r.stdout.strip().splitlines()[0]
-        except Exception:
-            pass
-        return None
-
-    def start_tunnel(self):
-        if self._proc and self._proc.poll() is None:
-            self._running = True
-            self.status_changed.emit("cf_running")
-            return
-
-        # Clean token automatically (remove 'cloudflared.exe service install' prefix if present)
-        raw_token = str(self.data_manager.server_config.get("cloudflare_token", "")).strip()
-        token = DataManager.clean_cloudflare_token(raw_token)
-        if not token:
-            self.status_changed.emit("cf_no_token")
-            print("[Cloudflare] Chưa có token tunnel.")
-            return
-
-        exe = self.find_exe()
-        if not exe:
-            self.status_changed.emit("cf_no_exe")
-            print("[Cloudflare] cloudflared.exe không tìm thấy!")
-            return
-
-        si = subprocess.STARTUPINFO()
-        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        si.wShowWindow = subprocess.SW_HIDE
-
-        cmd = [exe, "tunnel", "--no-autoupdate", "run", "--token", token]
-        try:
-            self._proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                startupinfo=si,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            self._running = True
-            self.status_changed.emit("cf_running")
-            print("[Cloudflare] Tunnel started.")
-            threading.Thread(target=self._watch_process, daemon=True, name="CloudflareWatch").start()
-        except Exception as e:
-            self._proc = None
-            self._running = False
-            self.status_changed.emit(f"cf_error:{e}")
-            print(f"[Cloudflare] Start lỗi: {e}")
-
-    def _watch_process(self):
-        proc = self._proc
-        if not proc:
-            return
-        code = proc.wait()
-        if self._running:
-            self._running = False
-            self._proc = None
-            self.status_changed.emit(f"cf_error:cloudflared exited ({code})")
-            print(f"[Cloudflare] Tunnel exited: {code}")
-
-    def stop_tunnel(self):
-        self._running = False
-        if self._proc and self._proc.poll() is None:
-            try:
-                self._proc.terminate()
-                self._proc.wait(timeout=2)
-            except Exception:
-                try:
-                    self._proc.kill()
-                except Exception:
-                    pass
-        self._proc = None
-        self.status_changed.emit("cf_stopped")
-        print("[Cloudflare] Tunnel stopped.")
-
-    def is_running(self) -> bool:
-        return bool(self._proc and self._proc.poll() is None)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2270,9 +2112,9 @@ class SearchUIWidget(QWidget):
             QListWidget::item:selected{background:rgba(255,255,255,30);color:white;font-weight:bold;}
             QListWidget::item:hover{background:rgba(255,255,255,10);}
         """)
-        self.list_widget.hide(); cl.addWidget(self.list_widget)
+        cl.addWidget(self.list_widget)
 
-        self.status_label = QLabel()
+        self.status_label = QLabel("")
         self.status_label.setStyleSheet(
             "QLabel{color:rgba(255,255,255,55);font-size:11px;"
             "padding:4px 14px;border:none;background:transparent;}"
@@ -3037,7 +2879,7 @@ class SettingUIWidget(QFrame):
         # ── Remote Server Section ─────────────────────────────────────────────
         sep = QFrame(); sep.setFixedHeight(1); sep.setStyleSheet("background:#444;")
         lo.addWidget(sep)
-        lo.addWidget(self._lbl("🌐 Remote Access / AI Executor"))
+        lo.addWidget(self._lbl("Remote Access (Tailscale/LAN)"))
 
         # Status indicator
         self.lbl_server_status = QLabel("● Chưa khởi động")
@@ -3047,134 +2889,37 @@ class SettingUIWidget(QFrame):
 
         mode_row = QHBoxLayout(); mode_row.setSpacing(10)
         self.chk_use_tailscale = QCheckBox("Use Tailscale")
-        self.chk_use_cloudflare = QCheckBox("Use Cloudflare Tunnel")
         self.chk_allow_lan = QCheckBox("Allow LAN")
         self.chk_prefer_tailscale = QCheckBox("Prefer Tailscale")
-        for chk in (self.chk_use_tailscale, self.chk_use_cloudflare, self.chk_allow_lan, self.chk_prefer_tailscale):
+        for chk in (self.chk_use_tailscale, self.chk_allow_lan, self.chk_prefer_tailscale):
             chk.setFont(QFont("Segoe UI", 9))
             chk.setStyleSheet("QCheckBox{color:#E0E0E0;spacing:6px;}")
             chk.setCursor(Qt.PointingHandCursor)
         if self.parent_menu and self.parent_menu.data_manager:
             cfg = self.parent_menu.data_manager.server_config
-            # Enforce mutual exclusivity: only ONE connection method can be active
-            use_cf = bool(cfg.get("use_cloudflare", False))
             use_ts = bool(cfg.get("use_tailscale", True))
             use_lan = bool(cfg.get("allow_lan", False))
             
-            # Priority: Cloudflare > Tailscale > LAN
-            if use_cf:
-                self.chk_use_cloudflare.setChecked(True)
-                self.chk_use_tailscale.setChecked(False)
-                self.chk_allow_lan.setChecked(False)
-            elif use_ts:
+            # Priority: Tailscale > LAN
+            if use_ts:
                 self.chk_use_tailscale.setChecked(True)
-                self.chk_use_cloudflare.setChecked(False)
                 self.chk_allow_lan.setChecked(False)
             elif use_lan:
                 self.chk_allow_lan.setChecked(True)
                 self.chk_use_tailscale.setChecked(False)
-                self.chk_use_cloudflare.setChecked(False)
             else:
                 # Default to Tailscale
                 self.chk_use_tailscale.setChecked(True)
                 
             self.chk_prefer_tailscale.setChecked(bool(cfg.get("prefer_tailscale", True)))
         mode_row.addWidget(self.chk_use_tailscale)
-        mode_row.addWidget(self.chk_use_cloudflare)
         mode_row.addWidget(self.chk_allow_lan)
         mode_row.addWidget(self.chk_prefer_tailscale)
         lo.addLayout(mode_row)
         
         # Connect connection mode checkboxes to enforce mutual exclusivity
         self.chk_use_tailscale.toggled.connect(self._on_connection_mode_changed)
-        self.chk_use_cloudflare.toggled.connect(self._on_connection_mode_changed)
         self.chk_allow_lan.toggled.connect(self._on_connection_mode_changed)
-
-        # ── CLOUDFLARE COLLAPSIBLE SECTION ───────────────────────────────────
-        cf_header, cf_content = self._make_collapsible_header("☁ Cloudflare Tunnel Settings", expanded=False)
-        lo.addWidget(cf_header)
-        
-        cf_lo = QVBoxLayout(cf_content)
-        cf_lo.setContentsMargins(12, 12, 12, 12)
-        cf_lo.setSpacing(6)
-
-        cf_name_row = QHBoxLayout(); cf_name_row.setSpacing(6)
-        cf_name_row.addWidget(QLabel("CF Name:"))
-        self.inp_cf_name = QLineEdit()
-        self.inp_cf_name.setPlaceholderText("PentaKuRuv4")
-        self.inp_cf_name.setStyleSheet(
-            "QLineEdit{background:#111;border:1px solid #333;border-radius:4px;"
-            "color:#e3f2ff;padding:4px 8px;font-size:11px;}")
-        cf_name_row.addWidget(self.inp_cf_name)
-        cf_lo.addLayout(cf_name_row)
-
-        cf_id_row = QHBoxLayout(); cf_id_row.setSpacing(6)
-        cf_id_row.addWidget(QLabel("CF Tunnel ID:"))
-        self.inp_cf_tunnel_id = QLineEdit()
-        self.inp_cf_tunnel_id.setPlaceholderText("86c8277e-6f2b-45e1-ba96-696297a5bd09")
-        self.inp_cf_tunnel_id.setStyleSheet(
-            "QLineEdit{background:#111;border:1px solid #333;border-radius:4px;"
-            "color:#e3f2ff;padding:4px 8px;font-size:11px;font-family:monospace;}")
-        cf_id_row.addWidget(self.inp_cf_tunnel_id)
-        cf_lo.addLayout(cf_id_row)
-
-        cf_token_row = QHBoxLayout(); cf_token_row.setSpacing(6)
-        cf_token_row.addWidget(QLabel("CF Token:"))
-        self.inp_cf_token = QLineEdit()
-        self.inp_cf_token.setPlaceholderText("Cloudflare Tunnel Token")
-        self.inp_cf_token.setEchoMode(QLineEdit.Password)
-        self.inp_cf_token.setStyleSheet(
-            "QLineEdit{background:#111;border:1px solid #333;border-radius:4px;"
-            "color:#e3f2ff;padding:4px 8px;font-size:11px;}")
-        cf_token_row.addWidget(self.inp_cf_token)
-        cf_lo.addLayout(cf_token_row)
-
-        cf_route_host_row = QHBoxLayout(); cf_route_host_row.setSpacing(6)
-        cf_route_host_row.addWidget(QLabel("CF Hostname:"))
-        self.inp_cf_route_host = QLineEdit()
-        self.inp_cf_route_host.setPlaceholderText("pentakuV3")
-        self.inp_cf_route_host.setStyleSheet(
-            "QLineEdit{background:#111;border:1px solid #333;border-radius:4px;"
-            "color:#e3f2ff;padding:4px 8px;font-size:11px;}")
-        cf_route_host_row.addWidget(self.inp_cf_route_host)
-        cf_lo.addLayout(cf_route_host_row)
-
-        cf_route_path_row = QHBoxLayout(); cf_route_path_row.setSpacing(6)
-        cf_route_path_row.addWidget(QLabel("CF Path:"))
-        self.inp_cf_route_path = QLineEdit()
-        self.inp_cf_route_path.setPlaceholderText(".*")
-        self.inp_cf_route_path.setStyleSheet(
-            "QLineEdit{background:#111;border:1px solid #333;border-radius:4px;"
-            "color:#e3f2ff;padding:4px 8px;font-size:11px;font-family:monospace;}")
-        cf_route_path_row.addWidget(self.inp_cf_route_path)
-        cf_lo.addLayout(cf_route_path_row)
-
-        cf_service_row = QHBoxLayout(); cf_service_row.setSpacing(6)
-        cf_service_row.addWidget(QLabel("CF Service:"))
-        self.inp_cf_service_url = QLineEdit()
-        self.inp_cf_service_url.setPlaceholderText("http://localhost:7777")
-        self.inp_cf_service_url.setStyleSheet(
-            "QLineEdit{background:#111;border:1px solid #333;border-radius:4px;"
-            "color:#e3f2ff;padding:4px 8px;font-size:11px;font-family:monospace;}")
-        cf_service_row.addWidget(self.inp_cf_service_url)
-        cf_lo.addLayout(cf_service_row)
-
-        if self.parent_menu and self.parent_menu.data_manager:
-            cfg = self.parent_menu.data_manager.server_config
-            self.inp_cf_name.setText(str(cfg.get("cloudflare_tunnel_name", "PentaKuRuv4")))
-            self.inp_cf_tunnel_id.setText(str(cfg.get("cloudflare_tunnel_id", "86c8277e-6f2b-45e1-ba96-696297a5bd09")))
-            # Clean token automatically (remove 'cloudflared.exe service install' prefix if present)
-            raw_token = str(cfg.get("cloudflare_token", ""))
-            clean_token = DataManager.clean_cloudflare_token(raw_token) if raw_token else ""
-            self.inp_cf_token.setText(clean_token)
-            self.inp_cf_route_host.setText(str(cfg.get("cloudflare_route_hostname", "pentakuV3")))
-            self.inp_cf_route_path.setText(str(cfg.get("cloudflare_route_path", ".*")))
-            self.inp_cf_service_url.setText(str(cfg.get("cloudflare_service_url", "http://localhost:7777")))
-
-        lo.addWidget(cf_content)
-        self.cf_wrap = cf_content
-        self.chk_use_cloudflare.toggled.connect(self._on_cloudflare_toggle)
-        self._on_cloudflare_toggle(self.chk_use_cloudflare.isChecked())
 
         shared_row = QHBoxLayout(); shared_row.setSpacing(10)
         self.chk_allow_teamviewer = QCheckBox("Allow TeamViewer Control")
@@ -3254,6 +2999,55 @@ class SettingUIWidget(QFrame):
         
         lo.addWidget(lan_content)
         self.lan_wrap = lan_content
+
+        # ── AI SERVER (PUSH SECTORS) COLLAPSIBLE SECTION ─────────────────────
+        ai_hdr, ai_content = self._make_collapsible_header("🤖 AI Server — nhận sectors từ PentaKuRu", expanded=False)
+        lo.addWidget(ai_hdr)
+
+        ai_lo = QVBoxLayout(ai_content)
+        ai_lo.setContentsMargins(12, 12, 12, 12)
+        ai_lo.setSpacing(6)
+
+        ai_url_lbl = QLabel("Mỗi khi sector thay đổi, PentaKuRu tự động push lên AI server.")
+        ai_url_lbl.setStyleSheet("color:#88aacc;font-size:10px;background:transparent;")
+        ai_url_lbl.setWordWrap(True)
+        ai_lo.addWidget(ai_url_lbl)
+
+        ai_url_row = QHBoxLayout(); ai_url_row.setSpacing(6)
+        ai_url_row.addWidget(QLabel("AI URL:"))
+        self.inp_ai_url = QLineEdit()
+        self.inp_ai_url.setPlaceholderText("http://100.x.x.x:9090")
+        self.inp_ai_url.setStyleSheet(
+            "QLineEdit{background:#1a1a1a;border:1px solid #444;border-radius:4px;"
+            "color:white;padding:4px 8px;font-size:11px;font-family:monospace;}")
+        if self.parent_menu and self.parent_menu.data_manager:
+            self.inp_ai_url.setText(
+                self.parent_menu.data_manager.server_config.get("ai_server_url", ""))
+        ai_url_row.addWidget(self.inp_ai_url)
+        ai_lo.addLayout(ai_url_row)
+
+        ai_tok_row = QHBoxLayout(); ai_tok_row.setSpacing(6)
+        ai_tok_row.addWidget(QLabel("AI Token:"))
+        self.inp_ai_token = QLineEdit()
+        self.inp_ai_token.setPlaceholderText("Bearer token của AI server (config.json → auth_token)")
+        self.inp_ai_token.setEchoMode(QLineEdit.Password)
+        self.inp_ai_token.setStyleSheet(
+            "QLineEdit{background:#1a1a1a;border:1px solid #444;border-radius:4px;"
+            "color:white;padding:4px 8px;font-size:11px;}")
+        if self.parent_menu and self.parent_menu.data_manager:
+            self.inp_ai_token.setText(
+                self.parent_menu.data_manager.server_config.get("ai_server_token", ""))
+        ai_tok_row.addWidget(self.inp_ai_token)
+        ai_lo.addLayout(ai_tok_row)
+
+        btn_test_push = QPushButton("📤 Test Push Sectors")
+        btn_test_push.setCursor(Qt.PointingHandCursor)
+        btn_test_push.setStyleSheet(self._btn_css())
+        btn_test_push.clicked.connect(self._test_push_sectors)
+        ai_lo.addWidget(btn_test_push)
+
+        lo.addWidget(ai_content)
+        self.ai_wrap = ai_content
 
         # ── ADVANCED / AUTH COLLAPSIBLE SECTION ──────────────────────────────
         adv_header, adv_content = self._make_collapsible_header("⚙️ Advanced / Port & Auth", expanded=False)
@@ -3390,26 +3184,17 @@ class SettingUIWidget(QFrame):
         dm = self.parent_menu.data_manager
         dm.server_config["auth_token"] = self.inp_auth.text().strip() or dm.server_config["auth_token"]
         dm.server_config["use_tailscale"] = self.chk_use_tailscale.isChecked()
-        dm.server_config["use_cloudflare"] = self.chk_use_cloudflare.isChecked()
         dm.server_config["allow_lan"] = self.chk_allow_lan.isChecked()
         dm.server_config["prefer_tailscale"] = self.chk_prefer_tailscale.isChecked()
-        dm.server_config["cloudflare_tunnel_name"] = self.inp_cf_name.text().strip()
-        dm.server_config["cloudflare_tunnel_id"] = self.inp_cf_tunnel_id.text().strip()
-        # Clean token automatically when saving (remove 'cloudflared.exe service install' prefix if user pasted it)
-        raw_token = self.inp_cf_token.text().strip()
-        dm.server_config["cloudflare_token"] = DataManager.clean_cloudflare_token(raw_token)
-        dm.server_config["cloudflare_route_hostname"] = self.inp_cf_route_host.text().strip() or "pentakuV3"
-        dm.server_config["cloudflare_route_path"] = self.inp_cf_route_path.text().strip() or ".*"
-        dm.server_config["cloudflare_service_url"] = self.inp_cf_service_url.text().strip() or f"http://localhost:{dm.server_config.get('port', 7777)}"
         dm.server_config["allow_teamviewer_control"] = self.chk_allow_teamviewer.isChecked()
         dm.server_config["controller_mode"] = "shared_executor" if self.chk_shared_executor.isChecked() else "default_server_only"
         dm.server_config["default_controller"] = self.inp_default_controller.text().strip() or "penta_ai"
+        dm.server_config["ai_server_url"]   = self.inp_ai_url.text().strip()
+        dm.server_config["ai_server_token"] = self.inp_ai_token.text().strip()
         try:
             dm.server_config["port"] = int(self.inp_port.text().strip())
         except ValueError:
             pass
-        if dm.server_config.get("cloudflare_service_url", "").startswith("http://localhost:"):
-            dm.server_config["cloudflare_service_url"] = f"http://localhost:{dm.server_config.get('port', 7777)}"
         dm.save_server_config()
         if dm.server_config.get("allow_lan", False):
             self.inp_lan_url.setText(f"http://{SystemUtils.get_lan_ip()}:{dm.server_config.get('port', 7777)}")
@@ -3418,12 +3203,23 @@ class SettingUIWidget(QFrame):
         self.detected_label.setText("✓ Đã lưu cấu hình server")
         self.detected_label.setStyleSheet("color:#4dffb4;background:transparent;border:none;")
 
+    def _test_push_sectors(self):
+        """Test push sectors lên AI server ngay lập tức."""
+        if not (self.parent_menu and self.parent_menu.data_manager): return
+        dm = self.parent_menu.data_manager
+        # Lưu URL/token mới trước khi test
+        dm.server_config["ai_server_url"]   = self.inp_ai_url.text().strip()
+        dm.server_config["ai_server_token"] = self.inp_ai_token.text().strip()
+        dm.save_server_config()
+        dm.save_all_data()  # triggers push
+        self.detected_label.setText("📤 Đang push sectors lên AI server...")
+        self.detected_label.setStyleSheet("color:#ffcc44;background:transparent;border:none;")
+
     def _save_connection_mode_only(self):
         """Save only connection mode choices (auto-called when toggle changes)"""
         if not (self.parent_menu and self.parent_menu.data_manager): return
         dm = self.parent_menu.data_manager
         dm.server_config["use_tailscale"] = self.chk_use_tailscale.isChecked()
-        dm.server_config["use_cloudflare"] = self.chk_use_cloudflare.isChecked()
         dm.server_config["allow_lan"] = self.chk_allow_lan.isChecked()
         dm.server_config["prefer_tailscale"] = self.chk_prefer_tailscale.isChecked()
         dm.save_server_config()
@@ -3432,10 +3228,6 @@ class SettingUIWidget(QFrame):
             self.inp_lan_url.setText(f"http://{SystemUtils.get_lan_ip()}:{dm.server_config.get('port', 7777)}")
         else:
             self.inp_lan_url.setText("")
-
-    def _on_cloudflare_toggle(self, enabled: bool):
-        if hasattr(self, "cf_wrap"):
-            self.cf_wrap.setVisible(bool(enabled))
 
     def _on_connection_mode_changed(self):
         """Enforce mutual exclusivity: only ONE connection method can be active at a time"""
@@ -3447,26 +3239,13 @@ class SettingUIWidget(QFrame):
         # If sender is checked, uncheck the others
         if sender.isChecked():
             if sender == self.chk_use_tailscale:
-                self.chk_use_cloudflare.blockSignals(True)
                 self.chk_allow_lan.blockSignals(True)
-                self.chk_use_cloudflare.setChecked(False)
                 self.chk_allow_lan.setChecked(False)
-                self.chk_use_cloudflare.blockSignals(False)
-                self.chk_allow_lan.blockSignals(False)
-            elif sender == self.chk_use_cloudflare:
-                self.chk_use_tailscale.blockSignals(True)
-                self.chk_allow_lan.blockSignals(True)
-                self.chk_use_tailscale.setChecked(False)
-                self.chk_allow_lan.setChecked(False)
-                self.chk_use_tailscale.blockSignals(False)
                 self.chk_allow_lan.blockSignals(False)
             elif sender == self.chk_allow_lan:
                 self.chk_use_tailscale.blockSignals(True)
-                self.chk_use_cloudflare.blockSignals(True)
                 self.chk_use_tailscale.setChecked(False)
-                self.chk_use_cloudflare.setChecked(False)
                 self.chk_use_tailscale.blockSignals(False)
-                self.chk_use_cloudflare.blockSignals(False)
         
         # Auto-save connection mode choice immediately (no need to click Save button)
         self._save_connection_mode_only()
@@ -3489,20 +3268,10 @@ class SettingUIWidget(QFrame):
                 waits = []
                 if cfg.get("use_tailscale", True):
                     waits.append("Tailscale")
-                if cfg.get("use_cloudflare", False):
-                    waits.append("Cloudflare")
                 if waits:
                     base += " — chờ " + "/".join(waits) + "..."
             self.lbl_server_status.setText(base)
             self.lbl_server_status.setStyleSheet("color:#aaddff;background:transparent;")
-            self.btn_toggle_server.setText("■ Tắt Server")
-            self.btn_toggle_server.setStyleSheet(
-                "QPushButton{background:#332020;border:1px solid #6e2d2d;border-radius:5px;"
-                "padding:6px;color:#ff8888;font-weight:bold;}"
-                "QPushButton:hover{background:#442828;}")
-        elif status == "cf_running":
-            self.lbl_server_status.setText("● Cloudflare Tunnel đang chạy")
-            self.lbl_server_status.setStyleSheet("color:#4dffb4;background:transparent;")
             self.btn_toggle_server.setText("■ Tắt Server")
             self.btn_toggle_server.setStyleSheet(
                 "QPushButton{background:#332020;border:1px solid #6e2d2d;border-radius:5px;"
@@ -3519,9 +3288,6 @@ class SettingUIWidget(QFrame):
                 "QPushButton{background:#332020;border:1px solid #6e2d2d;border-radius:5px;"
                 "padding:6px;color:#ff8888;font-weight:bold;}"
                 "QPushButton:hover{background:#442828;}")
-        elif status == "cf_stopped":
-            self.lbl_server_status.setText("● Cloudflare Tunnel đã dừng")
-            self.lbl_server_status.setStyleSheet("color:#888;background:transparent;")
         elif status == "stopped":
             self.lbl_server_status.setText("● Đã dừng")
             self.lbl_server_status.setStyleSheet("color:#888;background:transparent;")
@@ -3533,18 +3299,9 @@ class SettingUIWidget(QFrame):
         elif status == "no_exe":
             self.lbl_server_status.setText("⚠ Tailscale chưa cài — tải tại tailscale.com")
             self.lbl_server_status.setStyleSheet("color:#ffaa44;background:transparent;")
-        elif status == "cf_no_exe":
-            self.lbl_server_status.setText("⚠ cloudflared chưa cài — tải tại cloudflare.com")
-            self.lbl_server_status.setStyleSheet("color:#ffaa44;background:transparent;")
-        elif status == "cf_no_token":
-            self.lbl_server_status.setText("⚠ Cloudflare chưa có token tunnel")
-            self.lbl_server_status.setStyleSheet("color:#ffaa44;background:transparent;")
         elif status == "not_connected":
             self.lbl_server_status.setText("⚠ Tailscale chưa đăng nhập — chạy: tailscale up")
             self.lbl_server_status.setStyleSheet("color:#ffaa44;background:transparent;")
-        elif status.startswith("cf_error:"):
-            self.lbl_server_status.setText(f"✗ {status[9:]}")
-            self.lbl_server_status.setStyleSheet("color:#ff6666;background:transparent;")
         elif status.startswith("error:"):
             self.lbl_server_status.setText(f"✗ {status[6:]}")
             self.lbl_server_status.setStyleSheet("color:#ff6666;background:transparent;")
@@ -4353,8 +4110,6 @@ class MainWindow(RadialMenu):
         self.flask_thread: Optional[FlaskServerThread] = None
         self.ts_manager = TailscaleManager(self.data_manager, self)
         self.ts_manager.status_changed.connect(self._on_ts_status)
-        self.cf_manager = CloudflareTunnelManager(self.data_manager, self)
-        self.cf_manager.status_changed.connect(self._on_cf_status)
         if self.data_manager.server_config.get("enabled", True):
             QTimer.singleShot(1500, self.start_remote_server)
         # ── System tray ────────────────────────────────────────────────────
@@ -4395,7 +4150,7 @@ class MainWindow(RadialMenu):
     # ── Remote server helpers ─────────────────────────────────────────────────
 
     def start_remote_server(self):
-        """Khởi động Flask + Tailscale/Cloudflare."""
+        """Khởi động Flask + Tailscale."""
         if not _FLASK_OK:
             self._on_flask_status("error:Flask chưa cài (pip install flask)")
             return
@@ -4408,16 +4163,11 @@ class MainWindow(RadialMenu):
         # Tailscale
         if self.data_manager.server_config.get("use_tailscale", True):
             self.ts_manager.start_tunnel()
-        # Cloudflare
-        if self.data_manager.server_config.get("use_cloudflare", False):
-            self.cf_manager.start_tunnel()
 
     def stop_remote_server(self):
-        """Dừng Flask + Tailscale/Cloudflare."""
+        """Dừng Flask + Tailscale."""
         if self.data_manager.server_config.get("use_tailscale", True):
             self.ts_manager.stop_tunnel()
-        if self.data_manager.server_config.get("use_cloudflare", False):
-            self.cf_manager.stop_tunnel()
         if self.flask_thread:
             self.flask_thread.stop_server()
             self.flask_thread.quit()
@@ -4435,13 +4185,6 @@ class MainWindow(RadialMenu):
     @Slot(str)
     def _on_ts_status(self, status: str):
         print(f"[Tailscale] {status}")
-        if hasattr(self, "setting_ui"):
-            self.setting_ui.update_server_status(status)
-        self._update_tray_status(status)
-
-    @Slot(str)
-    def _on_cf_status(self, status: str):
-        print(f"[Cloudflare] {status}")
         if hasattr(self, "setting_ui"):
             self.setting_ui.update_server_status(status)
         self._update_tray_status(status)
@@ -4486,20 +4229,10 @@ class MainWindow(RadialMenu):
             ip = status.split(":", 1)[1] if ":" in status and status.startswith("running:") else ""
             tip = f"PentaKuRu ● Server đang chạy  [{ip}]" if ip else "PentaKuRu ● Server đang chạy"
             self.tray.setToolTip(tip)
-        elif status == "cf_running":
-            self.tray.setToolTip("PentaKuRu ● Cloudflare Tunnel đang chạy")
         elif status in ("stopped", "not_connected"):
             self.tray.setToolTip("PentaKuRu ○ Server đã dừng")
-        elif status == "cf_stopped":
-            self.tray.setToolTip("PentaKuRu ○ Cloudflare Tunnel đã dừng")
         elif status == "no_exe":
             self.tray.setToolTip("PentaKuRu ⚠ Tailscale chưa cài")
-        elif status == "cf_no_exe":
-            self.tray.setToolTip("PentaKuRu ⚠ cloudflared chưa cài")
-        elif status == "cf_no_token":
-            self.tray.setToolTip("PentaKuRu ⚠ Cloudflare chưa có token")
-        elif status.startswith("cf_error:"):
-            self.tray.setToolTip(f"PentaKuRu ✗ {status[9:]}")
         elif status.startswith("error:"):
             self.tray.setToolTip(f"PentaKuRu ✗ {status[6:]}")
 

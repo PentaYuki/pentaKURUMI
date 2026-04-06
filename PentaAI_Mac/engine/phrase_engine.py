@@ -9,6 +9,7 @@ Thay đổi so với bản gốc:
   - Token overlap: Jaccard riêng cho tiếng Việt (xử lý từ ghép có dấu)
   - Thêm get_uncertain() → cho phép AI hỏi lại khi không chắc
   - Thêm score_debug() → dễ debug từng entry
+  - Redis cache: query vectors (TTL 1h) + match results (TTL 5p)
 
 Flow tìm kiếm (3 bước theo thứ tự ưu tiên):
 
@@ -23,12 +24,27 @@ Flow tìm kiếm (3 bước theo thứ tự ưu tiên):
     Jaccard + order bonus (cải tiến xử lý dấu tiếng Việt)
 """
 
+import hashlib
+import json as _json
 from typing import List, Optional, Dict, Tuple
 from dataclasses import dataclass, field
 import re
 
 from engine.embedder import Embedder
 from config import FUZZY_MIN_SCORE
+
+# ── Redis semantic cache (optional) ──────────────────────────────────────────
+try:
+    import redis as _redis_mod
+    _rdb = _redis_mod.Redis(host="localhost", port=6379, db=1, decode_responses=True)
+    _rdb.ping()
+    _REDIS_SEM_OK = True
+except Exception:
+    _rdb = None
+    _REDIS_SEM_OK = False
+
+_REDIS_VEC_TTL   = 3600   # cache query embedding 1 giờ
+_REDIS_MATCH_TTL = 300    # cache match result 5 phút
 
 # ── Ngưỡng ──────────────────────────────────────────────────────
 EMBED_MIN_SCORE = 0.68   # FIX: tăng từ 0.55 → tránh match nhầm
@@ -51,6 +67,61 @@ class PhraseEngine:
     def __init__(self):
         self._embedder      = Embedder()
         self._trigger_cache: Dict[str, List[float]] = {}
+        self._phrases_sig: str = ""   # hash của trigger list — dùng để invalidate Redis cache
+
+    # ── Redis helpers ──────────────────────────────────────────────
+
+    def _r_get_vec(self, text: str) -> Optional[List[float]]:
+        if not _REDIS_SEM_OK or _rdb is None:
+            return None
+        try:
+            raw = _rdb.get(f"sem:qvec:{hashlib.md5(text.encode()).hexdigest()}")
+            return _json.loads(raw) if raw else None
+        except Exception:
+            return None
+
+    def _r_set_vec(self, text: str, vec: List[float]) -> None:
+        if not _REDIS_SEM_OK or _rdb is None:
+            return
+        try:
+            _rdb.setex(
+                f"sem:qvec:{hashlib.md5(text.encode()).hexdigest()}",
+                _REDIS_VEC_TTL, _json.dumps(vec),
+            )
+        except Exception:
+            pass
+
+    def _r_get_match(self, query: str) -> Optional["MatchResult"]:
+        if not _REDIS_SEM_OK or _rdb is None or not self._phrases_sig:
+            return None
+        try:
+            key = f"sem:match:{hashlib.md5(query.encode()).hexdigest()}:{self._phrases_sig}"
+            raw = _rdb.get(key)
+            if not raw:
+                return None
+            d = _json.loads(raw)
+            return MatchResult(
+                trigger=d["trigger"], responses=d["responses"],
+                score=d["score"], matched_by=d["matched_by"],
+                uncertain=d.get("uncertain", False),
+            )
+        except Exception:
+            return None
+
+    def _r_set_match(self, query: str, result: Optional["MatchResult"]) -> None:
+        if not _REDIS_SEM_OK or _rdb is None or not self._phrases_sig or result is None:
+            return
+        try:
+            key = f"sem:match:{hashlib.md5(query.encode()).hexdigest()}:{self._phrases_sig}"
+            _rdb.setex(key, _REDIS_MATCH_TTL, _json.dumps({
+                "trigger":    result.trigger,
+                "responses":  result.responses,
+                "score":      result.score,
+                "matched_by": result.matched_by,
+                "uncertain":  result.uncertain,
+            }))
+        except Exception:
+            pass
 
     # ── PUBLIC ────────────────────────────────────────────────────
 
@@ -64,7 +135,7 @@ class PhraseEngine:
 
         query_clean = query.lower().strip()
 
-        # Bước 1: Exact
+        # Bước 1: Exact (luôn kiểm tra trước khi hỏi cache)
         for entry in phrases:
             if query_clean == entry["trigger"]:
                 return MatchResult(
@@ -72,17 +143,22 @@ class PhraseEngine:
                     score=1.0, matched_by="exact",
                 )
 
+        # Bước 1b: Redis cache cho câu đã từng match
+        cached = self._r_get_match(query_clean)
+        if cached is not None:
+            return cached
+
         # Bước 2: Embedding (với gap check)
         embed_result, runner_up_score = self._embedding_match_with_gap(query_clean, phrases)
 
         if embed_result:
             gap = embed_result.score - runner_up_score
             if embed_result.score >= EMBED_MIN_SCORE and gap >= GAP_MIN:
-                # Match chắc chắn
+                self._r_set_match(query_clean, embed_result)
                 return embed_result
             elif embed_result.score >= SOFT_FLOOR:
-                # Vùng uncertain: trả về nhưng đánh dấu để caller quyết định
                 embed_result.uncertain = True
+                self._r_set_match(query_clean, embed_result)
                 return embed_result
 
         # Bước 3: Token overlap fallback
@@ -92,9 +168,9 @@ class PhraseEngine:
                 best = embed_result
             else:
                 best = token_result
-            # Nếu score thấp vẫn đánh dấu uncertain
             if best.score < EMBED_MIN_SCORE:
                 best.uncertain = True
+            self._r_set_match(query_clean, best)
             return best
 
         return None
@@ -109,8 +185,13 @@ class PhraseEngine:
         if triggers:
             vectors = self._embedder.encode_batch(triggers)
             self._trigger_cache = dict(zip(triggers, vectors))
+            # Cập nhật phrases_sig để invalidate Redis match cache
+            self._phrases_sig = hashlib.md5(
+                "|".join(sorted(triggers)).encode()
+            ).hexdigest()[:10]
         else:
             self._trigger_cache = {}
+            self._phrases_sig = ""
 
     def get_top_matches(
         self,
@@ -164,7 +245,11 @@ class PhraseEngine:
         Trả về (best_match, runner_up_score).
         Gap = best.score - runner_up cho phép phát hiện ambiguous.
         """
-        query_vec  = self._embedder.encode(query_clean)
+        # Cache query vector (Redis → memory → compute)
+        query_vec = self._r_get_vec(query_clean)
+        if query_vec is None:
+            query_vec = self._embedder.encode(query_clean)
+            self._r_set_vec(query_clean, query_vec)
         scores     = []
 
         for entry in phrases:

@@ -391,7 +391,9 @@ def parse_show_schedule_token(text: str) -> Tuple[str, bool]:
     if not text:
         return "", False
     cleaned = re.sub(r"<URL>\s*SHOW_SCHEDULE\s*</URL>", "", text, flags=re.IGNORECASE)
-    had_token = cleaned != text or ("SHOW_SCHEDULE" in text.upper())
-    cleaned = cleaned.replace("SHOW_SCHEDULE", "").strip()
+    # Chỉ coi là có token khi regex thực sự match (<URL>SHOW_SCHEDULE</URL>)
+    # Tránh false positive khi text tình cờ chứa chuỗi SHOW_SCHEDULE từ nguồn khác
+    had_token = cleaned != text
+    cleaned = re.sub(r"\bSHOW_SCHEDULE\b", "", cleaned, flags=re.IGNORECASE).strip()
     cleaned = re.sub(r"\s{2,}", " ", cleaned)
     return cleaned, had_token

@@ -25,7 +25,7 @@ from engine.choice_responder   import ChoiceResponder
 
 # --- TÍCH HỢP BỘ NHỚ LLM (REDIS + FAISS) ---
 try:
-    from penta_memory import PentaMemory
+    from API_local.penta_memory import PentaMemory
     llm_memory = PentaMemory()
 except ImportError:
     import logging
@@ -95,7 +95,7 @@ class PentaAI:
                 pass
 
         # Interpreter để làm "bộ não" Cloud
-        from ollama_command import get_default_interpreter
+        from API_local.ollama_command import get_default_interpreter
         self.interpreter = get_default_interpreter()
         self.enable_chat_llm_fallback = self._load_chat_llm_flag()
 
@@ -164,12 +164,14 @@ class PentaAI:
                     parsed.clean, intent.type, parsed.language
                 )
                 
-                # 1. Kiểm tra nếu AI đang "dỗi" (làm việc quá sức) -> Mở YouTube
-                if h_modifiers.get("emotional_state") == "upset_rest" or h_modifiers.get("spontaneous_text", "").find("giận") != -1:
-                    h_modifiers["spontaneous_text"] += " <URL>https://www.youtube.com/results?search_query=nỗi+buồn+của+cái+máy</URL>"
-                
-                # 2. Kiểm tra nếu người dùng hỏi lịch trình -> SHOW_SCHEDULE
-                sc_keywords = ["lịch", "thời biểu", "lịch trình", "schedule", "công việc trong tuần"]
+                # 1. Khi AI "dỗi" / overworked → phát nhạc chill local (không mở YouTube buồn)
+                # ai_server.py xử lý _local_play action; main.py chỉ gắn token gợi ý nhạc chill.
+                if h_modifiers.get("emotional_state") == "upset_rest":
+                    h_modifiers["_suggest_chill_music"] = True  # ai_server bắt và phát local
+
+                # 2. Kiểm tra nếu người dùng HỎI lịch trình rõ ràng -> SHOW_SCHEDULE
+                # Dùng danh sách ngắn, chính xác hơn để tránh false positive
+                sc_keywords = ["lịch tuần", "thời biểu", "lịch trình", "schedule", "công việc trong tuần", "xem lịch"]
                 is_asking_schedule = any(k in parsed.clean.lower() for k in sc_keywords)
                 if is_asking_schedule:
                     h_modifiers["spontaneous_text"] += " <URL>SHOW_SCHEDULE</URL>"
@@ -226,9 +228,13 @@ class PentaAI:
         response = response.replace(self.profile.pronoun, user_call)
         
         # Gắn thêm câu bộc lộ cảm xúc chủ động (Proactive Text)
+        # Lọc bỏ các token nội bộ (<URL>...</URL>) trước khi gắn vào response
         spon = h_modifiers.get("spontaneous_text", "")
         if spon:
-            response = f"{response} {spon}"
+            import re as _re
+            spon_clean = _re.sub(r"<URL>.*?</URL>", "", spon, flags=_re.IGNORECASE).strip()
+            if spon_clean and spon_clean not in response:
+                response = f"{response} {spon_clean}"
 
         self.context.push("ai", response, parsed.language)
         return response
