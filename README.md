@@ -35,35 +35,27 @@ Hệ sinh thái pentaKURUMI bao gồm 3 thành phần chính:
 
 ---
 
-## ✨ Nâng cấp mới (04/2026)
+### 1) Ultra-Low Latency MLX Engine & KV Cache
+- Chuyển đổi từ bonsai client sang **Embedded MLX-vLLM** (Qwen2.5-7B-Instruct-4bit).
+- Triển khai **Stateful KV Caching**: Tăng tốc prefill history lên 70% (từ 15s xuống còn ~5s).
+- **Phân luồng thông minh (Hybrid Routing)**:
+    - Tier 1: Ollama 3.2 1B cho các câu casual/ngắn (TTFT < 300ms).
+    - Tier 2: MLX 7B cho các tác vụ tư duy phức tạp.
 
-### 1) Gmail Notification Flow (full stack)
+### 2) Hệ thống Bộ nhớ Đa tầng (Redis + FAISS)
+- **Short-term Memory (Redis)**: Lưu trữ context hội thoại bền vững, không mất khi restart server.
+- **Long-term Memory (FAISS RAG)**: Tích hợp RAG với `nomic-embed-text` để truy xuất ký ức từ mọi cuộc hội thoại trong quá khứ.
+- **Vault System**: Tự động lưu các cặp Q&A quan trọng vào "Hầm ký ức" vector.
+
+### 3) Gmail Notification Flow (full stack)
 - Bật/tắt bằng voice: "bật pentagmail", "tắt pentagmail".
 - Daemon theo dõi email whitelist, xếp hàng queue và hỏi xác nhận trước khi đọc nội dung.
-- Nếu user chưa phản hồi: tự nhắc lại sau theo `gmail_notification_retry_interval_sec`.
-- Hỗ trợ API riêng: whitelist/queue/response/clear/enable.
-- Dữ liệu whitelist tách riêng tại `PentaAI_Mac/data/gmail_notify_whitelist.json`.
 
-### 2) TTS phát tuần tự, không chồng tiếng
-- Chat TTS và proactive TTS đã được serialize để phát lần lượt.
-- Tránh hiện tượng trả lời song song gây khó nghe trong luồng hội thoại dài.
+### 4) Chuẩn hóa & Tối ưu hóa
+- Tự động **Pre-warm model** ngay khi server khởi động.
+- TTS phát tuần tự, không chồng tiếng, hỗ trợ đa ngôn ngữ (VI/EN/JP).
+- Tách nhóm API local vào `PentaAI_Mac/API_local/` dễ dàng bảo trì.
 
-### 3) Cải tiến lấy nội dung email
-- Tăng độ ổn định khi đọc nội dung thật từ IMAP (ưu tiên `RFC822`, fallback hợp lệ).
-- Cải thiện decode sender/subject và fallback nội dung HTML -> text.
-
-### 4) Chuẩn hóa module theo hướng mở rộng
-- Tách nhóm API local vào `PentaAI_Mac/API_local/` (`ollama_command.py`, `penta_memory.py`, `pentami_chat.py`).
-- Bổ sung `PentaAI_Mac/skillmanager.py` + thư mục `PentaAI_Mac/skills/` cho kiến trúc plugin skill.
-- Thêm `PentaAI_Mac/services/gmail_notification_daemon.py` cho background service chuyên biệt.
-
-### 5) Help/CLI đầy đủ hơn
-- Mục hướng dẫn đã bổ sung rõ "Chế độ Lịch" và "Chế độ Dạy A -> B" với câu mẫu thực tế.
-
-### 6) Tài liệu mới
-- `GMAIL_NOTIFICATION_QUICKSTART.md`
-- `GMAIL_NOTIFICATION_GUIDE.md`
-- `GMAIL_NOTIFICATION_DEPLOYMENT.md`
 
 ---
 

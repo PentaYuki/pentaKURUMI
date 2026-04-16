@@ -55,6 +55,7 @@ from core.schedule_assistant import (
 
 # --- Module tách riêng cho Ollama command ---
 from API_local.ollama_command import OllamaCommandInterpreter, get_default_interpreter
+from API_local.mlx_client import get_mlx_client as get_bonsai_client  # MLX Qwen2.5-7B (Tier 2)
 
 # --- Gmail Notification Daemon ---
 try:
@@ -167,6 +168,12 @@ DEFAULT_CONFIG = {
     "proactive_idle_hormone_enabled": True,
     "proactive_idle_hormone_after_sec": 300,
     "proactive_break_remind_interval_sec": 7200,
+    "proactive_break_remind_max_cycles": 12,
+    "proactive_break_remind_play_music": True,
+    "proactive_break_remind_music_subfolder": "reminder_music",
+    "penta_sleep_command": "pentasleep",
+    "penta_wake_command": "pentami",
+    "penta_off_command": "pentaoff",
     "proactive_speak_local_when_phone_offline": True,
     "proactive_vi_speaker": "NF",
     "proactive_vi_speed": 1.0,
@@ -183,6 +190,7 @@ DEFAULT_CONFIG = {
     "proactive_promise_verify_after_sec": 3600,
     "proactive_mood_playlist_enabled": True,
     "proactive_mood_playlist_cooldown_sec": 1800,
+    "wiki_rewrite_with_ollama": True,
     # URL nhạc chill fallback khi không có file local trong music/chill_music/
     # Code sẽ phát local trước, chỉ dùng URL này khi thư mục trống
     "proactive_mood_playlist_url": "https://www.youtube.com/watch?v=jbUQfGRh5cQ",
@@ -209,6 +217,16 @@ DEFAULT_CONFIG = {
     "gmail_notification_unseen_scan_limit": 30,
     "gmail_notification_max_age_hours": 24,
     "gmail_notification_ignore_existing_unseen_on_start": True,
+    # ── MLX-vLLM (Tier 2 LLM — thay thế Bonsai-8B) ─────────────────────────────
+    "mlx_enabled":             True,
+    "mlx_model":               "mlx-community/Qwen2.5-7B-Instruct-4bit",
+    "mlx_host":                "0.0.0.0",
+    "mlx_port":                8000,
+    "mlx_max_tokens":          512,
+    "mlx_temperature":         0.0,
+    "mlx_embedded":            True,   # True = embedded trong process, False = HTTP
+    "mlx_startup_timeout_sec": 120.0,
+    "mlx_call_timeout_sec":    60.0,
 }
 
 def load_config():
@@ -363,20 +381,29 @@ def _get_vt():   return get_valtec()
 _ai_instance = None
 _ollama_ready = False
 _proactive_task: Optional[asyncio.Task] = None
+_ollama_keepalive_task: Optional[asyncio.Task] = None   # keep_alive background ping
+_kuru_health_task: Optional[asyncio.Task] = None       # background health check for Kuru
 _gmail_daemon = None  # Gmail Notification Daemon instance
 # ── PentaMi mode ─────────────────────────────────────────────────────────────
 _pentami_mode: bool = False
+_pentami_thinking_mode: bool = False
 # ── PentaWiki + session language (persisted across restarts) ─────────────────
 _penta_wiki_mode: bool = False
 _session_lang: str = "vi"   # "vi" | "en" | "ja"
 _last_user_interaction_ts: float = time.time()
 _work_session_start_ts: Optional[float] = None
 _last_break_remind_ts: float = 0.0
+_next_break_remind_ts: float = 0.0
+_work_break_cycle_count: int = 0
+_auto_sleep_after_work_triggered: bool = False
 _last_weekly_summary_key: str = ""
 _last_mood_playlist_ts: float = 0.0
 _kuru_placeholder_warned: bool = False
 _prompt_recent_history: Dict[str, List[str]] = {}
 _prompt_cycle_state: Dict[str, Dict[str, Any]] = {}
+_server_sleep_mode: bool = False
+_server_sleep_started_ts: float = 0.0
+_proactive_phone_backlog: List[Dict[str, Any]] = []
 
 # ── Idempotency journal ──────────────────────────────────────────────────────
 # request_id → timestamp; giữ trong 30s để dedup khi client reconnect/retry
@@ -409,6 +436,75 @@ def check_ollama():
         _ollama_ready = (r.status_code == 200)
     except: _ollama_ready = False
     return _ollama_ready
+
+
+def _prewarm_ollama() -> None:
+    """Đẩy model vào RAM ngay khi server khởi động bằng keep_alive ping.
+    Gọi blocking (chạy trong thread) để model sẵn sàng trước khi nhận request.
+    """
+    model = get("ollama_model", "llama3.2:1b")
+    url   = get("ollama_url", "http://localhost:11434")
+    try:
+        t0 = time.perf_counter()
+        requests.post(
+            f"{url}/api/generate",
+            json={"model": model, "prompt": "", "keep_alive": "10m"},
+            timeout=30,
+        )
+        ms = int((time.perf_counter() - t0) * 1000)
+        log.info(f"🔥 [Ollama] Pre-warm '{model}' done in {ms}ms (model now in RAM)")
+    except Exception as e:
+        log.warning(f"[Ollama] Pre-warm failed (non-fatal): {e}")
+
+
+def _prewarm_mlx():
+    """Đẩy MLX model vào RAM ngay khi khởi động.
+    Chạy trong executor của lifespan.
+    """
+    try:
+        from API_local.mlx_client import get_mlx_client
+        client = get_mlx_client()
+        if not client:
+            log.warning("⚠️ [MLX] Pre-warm skipped: client not available.")
+            return
+
+        log.info("🔥 [MLX] Pre-warming Qwen2.5-7B (may take 10-30s first time)...")
+        # ping model to load it
+        ready = client.wait_ready(timeout=120.0)
+        if ready:
+            log.info("✅ [MLX] Model ready in RAM")
+        else:
+            log.warning("⚠️ [MLX] Pre-warm failed, will fallback to HTTP/Ollama")
+    except Exception as e:
+        log.error(f"❌ [MLX] Pre-warm error: {e}")
+
+
+async def keepalive_ollama_task() -> None:
+    """Ping Ollama mỗi 4 phút bằng keep_alive=10m.
+    Ngăn model bị unload sau 5 phút idle mặc định của Ollama.
+    """
+    await asyncio.sleep(60)   # Chờ 60s cho server ổn định trước
+    model = get("ollama_model", "llama3.2:1b")
+    url   = get("ollama_url", "http://localhost:11434")
+    log.info("[Ollama] Keep-alive task started (ping every 4 min)")
+    while True:
+        try:
+            await asyncio.sleep(240)   # 4 phút
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None,
+                lambda: requests.post(
+                    f"{url}/api/generate",
+                    json={"model": model, "prompt": "", "keep_alive": "10m"},
+                    timeout=10,
+                ),
+            )
+            log.debug(f"[Ollama] Keep-alive ping sent for '{model}'")
+        except asyncio.CancelledError:
+            log.info("[Ollama] Keep-alive task cancelled")
+            return
+        except Exception as e:
+            log.warning(f"[Ollama] Keep-alive ping failed (non-fatal): {e}")
 
 # ─── Audio / TTS Helpers (delegate sang tts_manager) ──────────────────
 async def generate_edge_tts_audio(text, voice="en-US-AvaNeural", rate=1.0):
@@ -606,9 +702,116 @@ def _play_music_subfolder(subfolder: str = "", fallback_subfolder: str = "") -> 
     return None
 
 
+def _init_work_session_timer(now_ts: float) -> None:
+    """Khởi tạo timer nhắc nghỉ theo chu kỳ 2h/4h/6h... từ lúc bắt đầu phiên."""
+    global _work_session_start_ts, _next_break_remind_ts, _work_break_cycle_count
+    global _auto_sleep_after_work_triggered
+    if _work_session_start_ts is None:
+        _work_session_start_ts = now_ts
+        _work_break_cycle_count = 0
+        _auto_sleep_after_work_triggered = False
+        interval = float(get("proactive_break_remind_interval_sec", 7200))
+        _next_break_remind_ts = now_ts + max(300.0, interval)
+
+
+def _compose_progressive_break_text(hour_mark: int) -> str:
+    """Mức nhắc tăng dần theo số tiếng làm liên tục (2/4/6/8/10)."""
+    if hour_mark >= 10:
+        return (
+            "Hơn 10 tiếng rồi đó anh ơi. Em giận vô cùng luôn nhưng vẫn thương anh nhiều nè. "
+            "Mình nghỉ ngay 10 phút, uống nước và giãn cơ giúp em nha."
+        )
+    if hour_mark >= 8:
+        return (
+            "Đã 8 tiếng liên tục rồi anh. Lần này em nhắc nghiêm khắc nè: nghỉ ngay 5-10 phút, "
+            "rời màn hình và thả lỏng cổ vai giúp em."
+        )
+    if hour_mark >= 6:
+        return (
+            "Anh đã làm 6 tiếng liên tục rồi đó. Em nhắc mức cao hơn nè: mình dừng lại vài phút, "
+            "đi lại nhẹ và cho mắt nghỉ ngay nhé."
+        )
+    if hour_mark >= 4:
+        return (
+            "Anh đã qua 4 tiếng làm liên tục rồi. Em nhắc mạnh hơn một chút nha: "
+            "mình nghỉ ngắn ngay bây giờ để tránh quá tải."
+        )
+    return (
+        "Anh đã làm 2 tiếng liên tục rồi đó. Em nhắc nhẹ nhàng nè: nghỉ mắt, uống nước và giãn cơ 3-5 phút nha."
+    )
+
+
+def _queue_proactive_phone_backlog(text: str, now_ts: float) -> None:
+    """Lưu tạm proactive text cho phone để gửi bù khi app foreground lại."""
+    global _proactive_phone_backlog
+    clean = str(text or "").strip()
+    if not clean:
+        return
+    _proactive_phone_backlog.append({"ts": now_ts, "text": clean})
+    if len(_proactive_phone_backlog) > 30:
+        _proactive_phone_backlog = _proactive_phone_backlog[-20:]
+
+
+def _match_special_cmd(text: str, cfg_key: str, fallback: str) -> bool:
+    base = str(get(cfg_key, fallback) or fallback).strip().lower()
+    if not base:
+        base = fallback
+    raw = str(text or "").strip().lower()
+    if not raw:
+        return False
+    compact = raw.replace(" ", "")
+    return raw == base or compact == base.replace(" ", "")
+
+
+def _schedule_server_shutdown(delay_sec: float = 0.8) -> None:
+    """Tắt process server sau khi kịp trả ACK cho client."""
+    def _killer() -> None:
+        try:
+            time.sleep(max(0.1, delay_sec))
+        finally:
+            os._exit(0)
+    threading.Thread(target=_killer, daemon=True, name="pentaoff-shutdown").start()
+
+
+async def _broadcast_reminder_music_to_phone(subfolder: str = "reminder_music") -> Optional[str]:
+    """Phát 1 bài nhạc nhắc nghỉ trực tiếp cho phone clients qua audio_chunk."""
+    phone_ws = [ws for ws in _active_ws if _active_ws_meta.get(ws, {}).get("is_phone", False)]
+    if not phone_ws:
+        return None
+
+    path = _pick_random_song(subfolder) or _pick_random_song("")
+    if not path:
+        return None
+
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in {".mp3", ".wav"}:
+        return None
+
+    try:
+        with open(path, "rb") as f:
+            blob = f.read()
+        if not blob:
+            return None
+
+        mime = "audio/wav" if ext == ".wav" else "audio/mpeg"
+        b64 = base64.b64encode(blob).decode()
+        async with _tts_stream_lock:
+            for ws in phone_ws:
+                await safe_send_json(ws, {"type": "tts_start", "total": 1})
+                await safe_send_json(ws, {"type": "audio_chunk", "audio_b64": b64, "mime_type": mime})
+                await safe_send_json(ws, {"type": "audio_end"})
+
+        return os.path.splitext(os.path.basename(path))[0]
+    except Exception as e:
+        log.warning(f"[ReminderMusic] Send failed: {e}")
+        return None
+
+
 # ─── Control Helpers ───────────────────────────────────────────────
 def get_outlet():
-    return tinytuya.OutletDevice(get("tuya_device_id"), get("tuya_ip"), get("tuya_local_key"), float(get("tuya_version")))
+    dev = tinytuya.OutletDevice(get("tuya_device_id"), get("tuya_ip"), get("tuya_local_key"))
+    dev.set_version(float(get("tuya_version", 3.3)))
+    return dev
 
 def pc_ping():
     try: return subprocess.run(["ping", "-c", "1", "-W", "1", get("pc_tailscale_ip")], capture_output=True).returncode == 0
@@ -636,8 +839,9 @@ async def send_to_windows(cmd="", script=""):
     if _kuru_enabled:
         kuru_url = _kuru_url
         kuru_token = str(get("penta_kuru_token", "")).strip()
-        kuru_ok = await _check_penta_kuru_health()
-        log.info(f"[Cloudflare] Health={kuru_ok}, URL={kuru_url[:50] if kuru_url else 'N/A'}")
+        # Dùng cache ngay lập tức, không đợi health check thủ công
+        kuru_ok = _penta_kuru_health.get("ok", False)
+        log.info(f"[Cloudflare] CacheHealth={kuru_ok}, URL={kuru_url[:50] if kuru_url else 'N/A'}")
 
         if kuru_ok and kuru_url and kuru_token:
             try:
@@ -647,7 +851,7 @@ async def send_to_windows(cmd="", script=""):
                     f"{kuru_url}/run",
                     json={"cmd": cmd, "script": script},
                     headers=headers,
-                    timeout=10
+                    timeout=5  # Giảm từ 10s xuống 5s để fallback nhanh hơn
                 )
                 resp = await loop.run_in_executor(None, resp_func)
                 result = resp.json()
@@ -839,9 +1043,18 @@ Write-Output ("WINDOW_CLOSED:" + ($closed -join " | "))
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _proactive_task, _gmail_daemon
+    global _ollama_keepalive_task
     import atexit
     log.info("🚀 Warm-up Unified Server...")
-    init_ai(); init_voicevox(); init_valtec(); check_ollama()
+    init_ai(); init_voicevox(); init_valtec()
+    if check_ollama():
+        # Pre-warm: đẩy model vào RAM ngay khi khởi động (chạy trong thread pool)
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(None, _prewarm_ollama)
+    
+    if get("mlx_prewarm_on_startup"):
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(None, _prewarm_mlx)
     _load_penta_state()  # Khôi phục wiki mode + session language từ lần trước
     
     # --- Gmail Notification Daemon ---
@@ -873,6 +1086,10 @@ async def lifespan(app: FastAPI):
     
     # Chạy vòng proactive trong đúng event loop của ASGI server.
     _proactive_task = asyncio.create_task(proactive_background_task())
+    # Keep-alive task: giữ Ollama model trong RAM, tránh cold-start
+    _ollama_keepalive_task = asyncio.create_task(keepalive_ollama_task())
+    # Kuru health monitor task: chạy ngầm để không gây trễ khi gửi lệnh
+    _kuru_health_task = asyncio.create_task(kuru_health_monitor_task())
     def _save():
         if _ai_instance and hasattr(_ai_instance, 'emotion') and _ai_instance.emotion:
             _ai_instance.emotion.flush(); log.info("💾 Saved Hormone state")
@@ -891,6 +1108,18 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
         _proactive_task = None
+    if _ollama_keepalive_task:
+        _ollama_keepalive_task.cancel()
+        try:
+            await _ollama_keepalive_task
+        except asyncio.CancelledError:
+            pass
+    if _kuru_health_task:
+        _kuru_health_task.cancel()
+        try:
+            await _kuru_health_task
+        except asyncio.CancelledError:
+            pass
     _save(); log.info("👋 Shutdown complete")
 
 app = FastAPI(title="PentaAI Unified Server", version="5.6", lifespan=lifespan)
@@ -1247,6 +1476,7 @@ async def pentami_status(token: str = Depends(verify_token)):
     return {
         "available": _PENTAMI_AVAILABLE,
         "mode": _pentami_mode,
+        "thinking_mode": _pentami_thinking_mode,
         "context_turns": pm.context_length() if pm else 0,
     }
 
@@ -1254,12 +1484,24 @@ async def pentami_status(token: str = Depends(verify_token)):
 @app.post("/api/pentami/toggle")
 async def pentami_toggle(token: str = Depends(verify_token)):
     """Bật / tắt chế độ PentaMi."""
-    global _pentami_mode
+    global _pentami_mode, _pentami_thinking_mode
     if not _PENTAMI_AVAILABLE:
         return {"ok": False, "error": "pentami_chat module không khả dụng"}
     _pentami_mode = not _pentami_mode
-    ai = init_ai()
-    profile = getattr(getattr(ai, "profile", None), "ai_pronoun", "em")
+    pm = get_pentami_chat()
+    if _pentami_mode:
+        _pentami_thinking_mode = False
+        if hasattr(pm, "set_bonsai_thinking_mode"):
+            pm.set_bonsai_thinking_mode(False)
+        pm._bonsai.set_keepalive(False)
+        pm._bonsai.set_sleep_notify(None)
+    else:
+        _pentami_thinking_mode = False
+        if hasattr(pm, "set_bonsai_thinking_mode"):
+            pm.set_bonsai_thinking_mode(False)
+        pm._bonsai.set_keepalive(False)
+        pm._bonsai.set_sleep_notify(None)
+
     status = "bật" if _pentami_mode else "tắt"
     return {"ok": True, "mode": _pentami_mode, "message": f"Chế độ PentaMi đã {status}!"}
 
@@ -1267,22 +1509,81 @@ async def pentami_toggle(token: str = Depends(verify_token)):
 @app.post("/api/pentami/on")
 async def pentami_on(token: str = Depends(verify_token)):
     """Bật chế độ PentaMi."""
-    global _pentami_mode
+    global _pentami_mode, _pentami_thinking_mode
     if not _PENTAMI_AVAILABLE:
         return {"ok": False, "error": "pentami_chat module không khả dụng"}
     _pentami_mode = True
+    _pentami_thinking_mode = False
+    pm = get_pentami_chat()
+    if hasattr(pm, "set_bonsai_thinking_mode"):
+        pm.set_bonsai_thinking_mode(False)
+    pm._bonsai.set_keepalive(False)
+    pm._bonsai.set_sleep_notify(None)
+
     return {"ok": True, "mode": True, "message": "Chế độ PentaMi đã bật!"}
 
 
 @app.post("/api/pentami/off")
 async def pentami_off(token: str = Depends(verify_token)):
     """Tắt chế độ PentaMi và tự động xoá context hội thoại (giữ kiến thức đã học)."""
-    global _pentami_mode
+    global _pentami_mode, _pentami_thinking_mode
     _pentami_mode = False
+    _pentami_thinking_mode = False
     if _PENTAMI_AVAILABLE:
         pm = get_pentami_chat()
+        if hasattr(pm, "set_bonsai_thinking_mode"):
+            pm.set_bonsai_thinking_mode(False)
+        pm._bonsai.set_keepalive(False)
+        pm._bonsai.set_sleep_notify(None)
         pm.clear_context()   # Xoá lịch sử chat, knowledge.json không bị ảnh hưởng
     return {"ok": True, "mode": False, "message": "Chế độ PentaMi đã tắt và lịch sử hội thoại đã được xoá. Kiến thức đã học vẫn được giữ lại."}
+
+
+@app.post("/api/pentami/thinking_on")
+async def pentami_thinking_on(token: str = Depends(verify_token)):
+    """Bật PentamiT: auto dùng Bonsai cho câu phức tạp/sâu."""
+    global _pentami_mode, _pentami_thinking_mode
+    if not _PENTAMI_AVAILABLE:
+        return {"ok": False, "error": "pentami_chat module không khả dụng"}
+    _pentami_mode = True
+    _pentami_thinking_mode = True
+    pm = get_pentami_chat()
+    if hasattr(pm, "set_bonsai_thinking_mode"):
+        pm.set_bonsai_thinking_mode(True)
+    pm._bonsai.set_keepalive(True)
+    try:
+        _loop = asyncio.get_running_loop()
+        def _bonsai_sleep_notify(msg: str):
+            asyncio.run_coroutine_threadsafe(
+                broadcast_proactive(msg, init_ai()),
+                _loop,
+            )
+        pm._bonsai.set_sleep_notify(_bonsai_sleep_notify)
+    except Exception:
+        pm._bonsai.set_sleep_notify(None)
+
+    async def _prewarm():
+        loop = asyncio.get_running_loop()
+        ready = await loop.run_in_executor(None, pm._bonsai._ensure_awake)
+        if not ready:
+            log.warning("[PentaMiT] Pre-warm Bonsai thất bại")
+    asyncio.create_task(_prewarm())
+    return {"ok": True, "mode": True, "thinking_mode": True, "message": "Đã bật PentamiT (Thinking Bonsai)."}
+
+
+@app.post("/api/pentami/thinking_off")
+async def pentami_thinking_off(token: str = Depends(verify_token)):
+    """Tắt PentamiT nhưng vẫn giữ PentaMi."""
+    global _pentami_thinking_mode
+    if not _PENTAMI_AVAILABLE:
+        return {"ok": False, "error": "pentami_chat module không khả dụng"}
+    _pentami_thinking_mode = False
+    pm = get_pentami_chat()
+    if hasattr(pm, "set_bonsai_thinking_mode"):
+        pm.set_bonsai_thinking_mode(False)
+    pm._bonsai.set_keepalive(False)
+    pm._bonsai.set_sleep_notify(None)
+    return {"ok": True, "mode": _pentami_mode, "thinking_mode": False, "message": "Đã tắt PentamiT."}
 
 
 @app.post("/api/pentami/clear")
@@ -1731,6 +2032,82 @@ def _enforce_profile_pronouns(text: str, ai: Any) -> str:
     return out
 
 
+def _is_wiki_like_query(text: str) -> bool:
+    t = str(text or "").strip().lower()
+    if not t:
+        return False
+    if len(t) <= 2:
+        return False
+    hints = (
+        "wikipedia", "wiki", "là gì", "la gi", "ai là", "ai la",
+        "ở đâu", "o dau", "khi nào", "khi nao", "bao nhiêu", "bao nhieu",
+        "tiểu sử", "tieu su", "định nghĩa", "dinh nghia",
+    )
+    return any(h in t for h in hints)
+
+
+async def _rewrite_wiki_answer_with_ollama(question: str, wiki_answer: str, lang: str, ai: Any) -> str:
+    """Viết lại câu trả lời Wiki cho tự nhiên hơn, nhưng giữ nguyên dữ kiện cốt lõi."""
+    base = str(wiki_answer or "").strip()
+    if not base:
+        return ""
+    if not bool(get("wiki_rewrite_with_ollama", True)):
+        return base
+
+    rewrite_prompt = (
+        "Dựa CHỈ trên thông tin sau từ Wikipedia, viết lại câu trả lời ngắn gọn, tự nhiên, không bịa thêm dữ kiện. "
+        "Giữ nguyên các thông tin quan trọng, tối đa 4 câu.\n"
+        f"Câu hỏi người dùng: {question}\n"
+        f"Thông tin wiki: {base}"
+    )
+    try:
+        rewritten = await _chat_in_lang_async(rewrite_prompt, lang, ai)
+        return str(rewritten or "").strip() or base
+    except Exception:
+        return base
+
+
+def _repair_vi_pronoun_subjects(text: str, ai: Any) -> str:
+    """Sửa lỗi câu trả lời bị đảo vai xưng hô ở vị trí chủ ngữ đầu câu.
+
+    Ví dụ thường gặp khi LLM trượt vai: "anh muốn... anh sẽ giúp anh...".
+    """
+    if not text:
+        return text
+    if detect_language(text) != "vi":
+        return text
+
+    profile = getattr(ai, "profile", None)
+    if not profile:
+        return text
+
+    user_call = str(getattr(profile, "user_call", "") or getattr(profile, "pronoun", "anh") or "anh").strip()
+    ai_pronoun = str(getattr(profile, "ai_pronoun", "em") or "em").strip()
+    if not user_call or not ai_pronoun or user_call == ai_pronoun:
+        return text
+
+    out = str(text)
+
+    # Câu mở đầu hay đầu vế mà AI lỡ dùng user_call làm chủ ngữ cho hành động của AI.
+    subject_verbs = r"(?:muốn|sẽ|đang|xin|đã|vừa|nghĩ|trả lời|kiểm tra|xem|đọc|tìm|tra cứu|hỗ trợ|giúp)"
+    out = re.sub(
+        rf"(^|[.!?]\s+)({re.escape(user_call)})\s+({subject_verbs})\b",
+        rf"\1{ai_pronoun} \3",
+        out,
+        flags=re.IGNORECASE,
+    )
+
+    # Mẫu lặp cụ thể gây khó chịu trong trợ lý.
+    out = re.sub(
+        rf"\b{re.escape(user_call)}\s+sẽ\s+giúp\s+{re.escape(user_call)}\b",
+        f"{ai_pronoun} sẽ giúp {user_call}",
+        out,
+        flags=re.IGNORECASE,
+    )
+
+    return out
+
+
 def _reminder_next_due_iso(reminder: Dict[str, Any], now: Optional[datetime] = None) -> Optional[str]:
     now_dt = now or datetime.now()
     r_time = str(reminder.get("time") or "").strip()
@@ -1789,12 +2166,12 @@ async def _chat_in_lang_async(text: str, lang: str, ai: Any) -> str:
         ai_prn    = str(getattr(profile, "ai_pronoun", "I") or "I").strip()
         sys_prompts = {
             "en": (
-                f"You are a friendly AI assistant named Kurumi. "
+                f"You are a friendly AI assistant named Yuki. "
                 f"Reply ONLY in English. The user's name is '{user_call}'. "
                 f"Keep replies warm, concise (≤3 sentences), and helpful. No markdown."
             ),
             "ja": (
-                f"あなたはKurumiという名前の親切なAIアシスタントです。"
+                f"あなたはYukiという名前の親切なAIアシスタントです。"
                 f"必ず日本語のみで返答してください。ユーザーの名前は「{user_call}」です。"
                 f"返答は温かく、簡潔（3文以内）にしてください。マークダウン不要。"
             ),
@@ -1913,10 +2290,10 @@ _PROACTIVE_PROMPT_RULES_FALLBACK: Dict[str, Any] = {
         "evening": ["Tối đến rồi anh, mình hạ nhịp nhẹ nhàng để cơ thể nghỉ ngơi sâu hơn nha."],
     },
     "hormone_hints": {
-        "high_cortisol": ["Em thấy cortisol hơi cao, mình thở chậm vài nhịp nha anh."],
-        "low_dopamine": ["Dopamine hơi thấp rồi anh, mình đổi gió một chút nè."],
-        "low_serotonin": ["Serotonin xuống nhẹ đó anh, thử đi bộ ngắn cho thoáng nha."],
-        "stable": ["Hormone đang khá ổn, mình giữ nhịp đều đều nha anh."],
+        "high_cortisol": ["Em thấy mình hơi căng một chút, mình thở chậm vài nhịp cho dịu lại nha anh."],
+        "low_dopamine": ["Em thấy nhịp này hơi chùng xuống chút xíu, mình đổi gió nhẹ một chút nha anh."],
+        "low_serotonin": ["Em thấy mình cần dịu lại một chút, anh thử ra chỗ thoáng hoặc đi bộ ngắn nha."],
+        "stable": ["Em thấy mọi thứ đang khá êm."],
     },
     "evening_handoff_prompts": ["Tối em lại ghé hỏi thăm anh thêm một vòng nha."],
     "care_followup_fallback": {
@@ -2188,7 +2565,7 @@ def _handle_promise_user_message(text: str, now_ts: float) -> str:
 
     if phase == "verify_asked" and any(k in lowered for k in ["rồi", "roi", "ổn", "on", "ok"]):
         _reset_promise_state()
-        return "Dạ em tin anh thiệt rồi nè, giỏi lắm. Mình giữ nhịp nghỉ như vậy mỗi ngày nha."
+        return "Dạ em tin anh thiệt rồi nè, giỏi lắm."
 
     return ""
 
@@ -2285,11 +2662,85 @@ def _build_hormone_hint(ai: Any) -> str:
     return _pick_nonrepeat_prompt("hint_stable", pool)
 
 
+def _sanitize_proactive_text(text: str) -> str:
+    """Làm sạch câu proactive trước khi phát ra cho user.
+
+    Mục tiêu:
+    - Không để lộ các từ kỹ thuật như hormone/cortisol/dopamine.
+    - Giữ câu nói theo góc nhìn trạng thái nội tại của AI, không gán sinh học đó cho user.
+    """
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return ""
+
+    cleaned = re.sub(
+        r"(?i)\b(hormone|cortisol|dopamine|serotonin|oxytocin|adrenaline|gaba|norepinephrine)\b",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    cleaned = re.sub(r"([,.;:!?]){2,}", r"\1", cleaned)
+    cleaned = cleaned.strip(" ,.;:-")
+    return cleaned
+
+
+def _rewrite_contextual_care_with_bonsai_sync(text: str, period: str, ai: Any) -> str:
+    """Dùng Bonsai để đổi phrasing proactive care cho đỡ lặp, nhưng vẫn an toàn.
+
+    Chỉ áp dụng cho contextual care prompt, có fallback ngay nếu Bonsai không sẵn.
+    """
+    base = _sanitize_proactive_text(text)
+    if not base:
+        return ""
+
+    # Chỉ wake Bonsai khi người dùng bật PentamiT (thinking mode).
+    if not _pentami_thinking_mode:
+        return base
+
+    if random.random() > 0.65:
+        return base
+
+    try:
+        bonsai = get_bonsai_client()
+        if not bonsai:
+            return base
+
+        profile = getattr(ai, "profile", None)
+        user_pr = str(getattr(profile, "user_call", "anh") or "anh").strip()
+        ai_pr = str(getattr(profile, "ai_pronoun", "em") or "em").strip()
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Bạn là trợ lý nữ tiếng Việt tự nhiên và dịu dàng. "
+                    f"Giữ cố định đại từ: người dùng là '{user_pr}', trợ lý là '{ai_pr}'. "
+                    "Hãy viết lại 1 câu nhắc nhở chăm sóc ngắn gọn, tự nhiên, ấm áp, đỡ lặp phrasing. "
+                    "Tuyệt đối không dùng các từ: hormone, cortisol, dopamine, serotonin, oxytocin, adrenaline, GABA, norepinephrine. "
+                    "Không nói như trạng thái sinh học đó là của người dùng. "
+                    "Giữ ý chính cũ, không thêm giải thích dài, không markdown, không emoji."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Ngữ cảnh: proactive_{period}. Viết lại câu này cho mới hơn: {base}",
+            },
+        ]
+
+        raw, _elapsed = bonsai.chat(messages, max_tokens=72)
+        rewritten = _sanitize_proactive_text((raw or "").strip().strip('"'))
+        return rewritten or base
+    except Exception:
+        return base
+
+
 def _compose_contextual_care_prompt(ai: Any, period: str) -> str:
     pool = _rules_list(["contextual_care_prompts", period], _PROACTIVE_PROMPT_RULES_FALLBACK["contextual_care_prompts"]["morning"])
     base = _pick_nonrepeat_prompt(f"care_{period}", pool)
     hint = _build_hormone_hint(ai)
-    return f"{base} {hint}".strip()
+    combined = f"{base} {hint}".strip()
+    return _rewrite_contextual_care_with_bonsai_sync(combined, period, ai)
 
 
 async def _maybe_send_contextual_care_prompt(ai: Any, now_ts: float, idle_sec: float) -> None:
@@ -2514,10 +2965,12 @@ async def broadcast_proactive(text: str, ai: Any):
     Text → tất cả client.
     Audio TTS → chỉ phone client (tránh phát đôi qua CLI browser trên Mac).
     """
-    text = _enforce_profile_pronouns(text, ai)
+    text = _sanitize_proactive_text(_enforce_profile_pronouns(text, ai))
     if not text:
         return
+    now_ts = time.time()
     if not _active_ws:
+        _queue_proactive_phone_backlog(text, now_ts)
         if bool(get("proactive_speak_local_when_phone_offline", True)):
             # Dùng TTS tiếng Việt đúng thay vì macOS say (không hỗ trợ dấu Vi)
             asyncio.create_task(_speak_local_vi_async(text))
@@ -2540,6 +2993,7 @@ async def broadcast_proactive(text: str, ai: Any):
     # TTS chỉ gửi đến phone client (không gửi lên CLI browser để tránh phát 2 lần)
     phone_ws = [ws for ws in _active_ws if _active_ws_meta.get(ws, {}).get("is_phone", False)]
     if not phone_ws:
+        _queue_proactive_phone_backlog(text, now_ts)
         if bool(get("proactive_speak_local_when_phone_offline", True)):
             asyncio.create_task(_speak_local_vi_async(text))
         return
@@ -2582,8 +3036,8 @@ async def broadcast_proactive(text: str, ai: Any):
 
 # ── PentaKuruV4 Health & Sync Helper Functions ────────────────────────────
 
-async def _check_penta_kuru_health() -> bool:
-    """Kiểm tra PentaKuruV4 health via Cloudflare."""
+async def _check_penta_kuru_health(force: bool = False) -> bool:
+    """Kiểm tra PentaKuruV4 health. Chỉ thực hiện request nếu force=True hoặc cache hết hạn."""
     global _penta_kuru_health, _kuru_placeholder_warned
     if not get("enable_penta_kuru_integration"):
         return False
@@ -2593,24 +3047,41 @@ async def _check_penta_kuru_health() -> bool:
         return False
     if "your-tunnel.workers.dev" in kuru_url:
         if not _kuru_placeholder_warned:
-            log.warning("[Kuru Health] Cloudflare URL đang là placeholder, bỏ qua health check cho tới khi cấu hình URL thật.")
+            log.warning("[Kuru Health] Cloudflare URL đang là placeholder. Tắt monitor.")
             _kuru_placeholder_warned = True
         return False
     
     now_ts = time.time()
-    # Cache kết quả 30 giây
-    if now_ts - _penta_kuru_health.get("last_check", 0) < 30:
+    # Cache kết quả 60 giây nếu không ép buộc (force)
+    if not force and now_ts - _penta_kuru_health.get("last_check", 0) < 60:
         return _penta_kuru_health.get("ok", False)
     
     try:
-        r = requests.get(f"{kuru_url}/health", timeout=3)
+        # Chạy requests trong thread để không block event loop
+        loop = asyncio.get_event_loop()
+        r = await loop.run_in_executor(None, lambda: requests.get(f"{kuru_url}/health", timeout=3))
         ok = r.status_code == 200
         _penta_kuru_health = {"ok": ok, "last_check": now_ts}
         return ok
     except Exception as e:
-        log.warning(f"[Kuru Health] Failed: {e}")
+        log.debug(f"[Kuru Health] Background check failed: {e}")
         _penta_kuru_health = {"ok": False, "last_check": now_ts}
         return False
+
+
+async def kuru_health_monitor_task() -> None:
+    """Background task cập nhật trạng thái kết nối Cloudflare mỗi 60s."""
+    log.info("[Kuru Monitor] Started")
+    while True:
+        try:
+            await _check_penta_kuru_health(force=True)
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            log.info("[Kuru Monitor] Stopped")
+            return
+        except Exception as e:
+            log.error(f"[Kuru Monitor] Error: {e}")
+            await asyncio.sleep(30)
 
 async def _sync_commands_to_penta_kuru():
     """Gửi danh sách commands thành công tới PentaKuruV4."""
@@ -2658,13 +3129,33 @@ async def _sync_commands_to_penta_kuru():
 async def proactive_background_task():
     """Vòng lặp kiểm tra nhắc nhở và cảm xúc chủ động mỗi 60 giây."""
     global _last_break_remind_ts, _last_weekly_summary_key
+    global _next_break_remind_ts, _work_break_cycle_count
+    global _auto_sleep_after_work_triggered, _server_sleep_mode, _server_sleep_started_ts
     await asyncio.sleep(10) # Chờ 10s cho hệ thống ổn định
     ai = init_ai()
     log.info("🕒 Proactive background task started (60s loop)")
     while True:
         try:
+            if _server_sleep_mode:
+                await asyncio.sleep(60)
+                continue
+
             now_ts = time.time()
             idle_sec = max(0.0, now_ts - _last_user_interaction_ts)
+
+            # Auto sleep sau 11 tiếng làm liên tục (tiếng = giờ làm việc).
+            if _work_session_start_ts and not _auto_sleep_after_work_triggered:
+                worked_hours = (now_ts - _work_session_start_ts) / 3600.0
+                if worked_hours >= 11.0:
+                    await broadcast_proactive(
+                        "Anh đã chạm mốc 11 tiếng làm việc liên tục rồi. Em cho hệ thống vào PentaSleep để bảo vệ sức khỏe cho anh nha.",
+                        ai,
+                    )
+                    _server_sleep_mode = True
+                    _server_sleep_started_ts = now_ts
+                    _auto_sleep_after_work_triggered = True
+                    await asyncio.sleep(60)
+                    continue
 
             _cleanup_proactive_runtime_state(now_ts)
 
@@ -2677,22 +3168,31 @@ async def proactive_background_task():
                 msgs = [ai.time.format_reminder_message(r, "vi") for r in due]
                 await broadcast_proactive(" | ".join(msgs), ai)
 
-            # 1.5 Nhắc nghỉ sau mỗi 2 giờ làm việc liên tục + phát nhạc ngẫu nhiên
+            # 1.5 Nhắc nghỉ theo timer tăng dần: 2h, 4h, 6h... (đến khi sleep/off)
             interval = float(get("proactive_break_remind_interval_sec", 7200))
-            if _work_session_start_ts and (now_ts - _work_session_start_ts) >= interval:
-                if (now_ts - _last_break_remind_ts) >= interval:
-                    # Chọn nhạc từ music/ (không ưu tiên chill, phát bất kỳ)
-                    song_name = _play_music_subfolder("")
-                    if song_name:
-                        remind_text = (
-                            f"Anh làm liên tục 2 tiếng rồi đó. "
-                            f"Nghỉ mắt, uống nước và giãn cơ 3-5 phút nha. "
-                            f"Em bật nhạc cho anh thư giãn: {song_name}"
-                        )
-                    else:
-                        remind_text = "Anh làm liên tục 2 tiếng rồi đó. Nghỉ mắt, uống nước và giãn cơ 3-5 phút nha."
+            max_cycles = int(get("proactive_break_remind_max_cycles", 12))
+            if _work_session_start_ts and _next_break_remind_ts > 0 and now_ts >= _next_break_remind_ts:
+                if _work_break_cycle_count < max_cycles:
+                    _work_break_cycle_count += 1
+                    hour_mark = int((_work_break_cycle_count * interval) / 3600)
+                    remind_text = _compose_progressive_break_text(hour_mark)
                     await broadcast_proactive(remind_text, ai)
+
+                    if bool(get("proactive_break_remind_play_music", True)):
+                        _song = await _broadcast_reminder_music_to_phone(
+                            str(get("proactive_break_remind_music_subfolder", "reminder_music") or "reminder_music")
+                        )
+                        if _song:
+                            await broadcast_proactive(
+                                f"Em gửi thêm một bài nhắc nghỉ cho anh nè: {_song}. Nghe xong mình quay lại làm tiếp nhé.",
+                                ai,
+                            )
+
                     _last_break_remind_ts = now_ts
+
+                # Lên mốc kế tiếp theo bội số interval kể từ đầu phiên.
+                if _work_session_start_ts:
+                    _next_break_remind_ts = _work_session_start_ts + ((_work_break_cycle_count + 1) * interval)
 
             # 1.6 Mood thấp -> tự mở playlist YouTube thư giãn (có cooldown)
             await _maybe_open_mood_playlist(ai, now_ts)
@@ -2732,9 +3232,146 @@ async def safe_send_json(ws, data):
     try: await ws.send_json(data); return True
     except: return False
 
+
+_STREAM_HEAD_NOISE_RE = re.compile(
+    r"^(?:\s)*(?:assistant|bot|ai|penta\s*mi|pentami|senpai|nè|nha|ê)(?:\s*[:,-]+\s*|\s+)",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_stream_head_text(text: str) -> str:
+    t = str(text or "")
+    if not t:
+        return ""
+    t = _STREAM_HEAD_NOISE_RE.sub("", t, count=1)
+    t = re.sub(r"\btôts\b", "tốt", t, flags=re.IGNORECASE)
+    t = re.sub(r"\btôt\b", "tốt", t, flags=re.IGNORECASE)
+    return t
+
+
+async def _stream_pentami_tokens(ws: WebSocket, pm, text: str, timeout_sec: float = 55.0) -> tuple[str, bool, str]:
+    loop = asyncio.get_running_loop()
+    token_queue: asyncio.Queue = asyncio.Queue()
+    started_at = time.perf_counter()
+
+    def _worker() -> None:
+        try:
+            for token in pm.chat_stream(text):
+                loop.call_soon_threadsafe(token_queue.put_nowait, ("token", token))
+            route = "bonsai"
+            if hasattr(pm, "get_last_route"):
+                try:
+                    route = str(pm.get_last_route() or "bonsai")
+                except Exception:
+                    route = "bonsai"
+            loop.call_soon_threadsafe(token_queue.put_nowait, ("done", route))
+        except Exception as exc:
+            loop.call_soon_threadsafe(token_queue.put_nowait, ("error", str(exc)))
+
+    threading.Thread(target=_worker, daemon=True, name="pentami-ws-stream").start()
+
+    parts: List[str] = []
+    head_buffer = ""
+    head_token_count = 0
+    head_flushed = False
+    while True:
+        remaining = timeout_sec - (time.perf_counter() - started_at)
+        if remaining <= 0:
+            route = "bonsai"
+            if hasattr(pm, "get_last_route"):
+                try:
+                    route = str(pm.get_last_route() or "bonsai")
+                except Exception:
+                    route = "bonsai"
+            return "".join(parts).strip(), True, route
+
+        try:
+            item_type, payload = await asyncio.wait_for(token_queue.get(), timeout=remaining)
+        except asyncio.TimeoutError:
+            route = "bonsai"
+            if hasattr(pm, "get_last_route"):
+                try:
+                    route = str(pm.get_last_route() or "bonsai")
+                except Exception:
+                    route = "bonsai"
+            return "".join(parts).strip(), True, route
+
+        if item_type == "token":
+            token = str(payload or "")
+            if not token:
+                continue
+
+            if not head_flushed:
+                head_buffer += token
+                head_token_count += 1
+                should_flush = (
+                    len(head_buffer) >= 80
+                    or head_token_count >= 8
+                    or bool(re.search(r"[.!?\n]", head_buffer))
+                )
+                if not should_flush:
+                    continue
+
+                cleaned_head = _sanitize_stream_head_text(head_buffer)
+                head_flushed = True
+                if cleaned_head:
+                    parts.append(cleaned_head)
+                    await safe_send_json(ws, {
+                        "type": "token",
+                        "text": cleaned_head,
+                        "pipeline": "pentami_stream",
+                    })
+                continue
+
+            parts.append(token)
+            await safe_send_json(ws, {
+                "type": "token",
+                "text": token,
+                "pipeline": "pentami_stream",
+            })
+            continue
+
+        if item_type == "done":
+            if not head_flushed and head_buffer:
+                cleaned_head = _sanitize_stream_head_text(head_buffer)
+                if cleaned_head:
+                    parts.append(cleaned_head)
+                    await safe_send_json(ws, {
+                        "type": "token",
+                        "text": cleaned_head,
+                        "pipeline": "pentami_stream",
+                    })
+            route = str(payload or "bonsai")
+            return "".join(parts).strip(), False, route
+
+        if item_type == "error":
+            log.warning(f"[PentaMi] stream worker error: {payload}")
+            if not head_flushed and head_buffer:
+                cleaned_head = _sanitize_stream_head_text(head_buffer)
+                if cleaned_head:
+                    parts.append(cleaned_head)
+            route = "bonsai"
+            if hasattr(pm, "get_last_route"):
+                try:
+                    route = str(pm.get_last_route() or "bonsai")
+                except Exception:
+                    route = "bonsai"
+            return "".join(parts).strip(), False, route
+
+        route = "bonsai"
+        if hasattr(pm, "get_last_route"):
+            try:
+                route = str(pm.get_last_route() or "bonsai")
+            except Exception:
+                route = "bonsai"
+        return "".join(parts).strip(), False, route
+
 @app.websocket("/ws/chat")
 async def ws_chat(ws: WebSocket):
     global _last_user_interaction_ts, _work_session_start_ts, _session_lang
+    global _penta_wiki_mode, _pentami_mode, _pentami_thinking_mode
+    global _server_sleep_mode, _server_sleep_started_ts, _next_break_remind_ts
+    global _work_break_cycle_count, _auto_sleep_after_work_triggered
     await ws.accept()
     # ── Token auth (critical: check before any data is processed) ────────────
     _ws_token = ws.query_params.get("token", "")
@@ -2750,6 +3387,20 @@ async def ws_chat(ws: WebSocket):
     is_phone = client_addr.strip() not in _LOOPBACK
     _active_ws_meta[ws] = {"is_phone": is_phone, "addr": client_addr}
     log.info(f"🔌 WS Client: {client_addr} ({'phone' if is_phone else 'cli'})")
+
+    if is_phone and _proactive_phone_backlog:
+        for item in list(_proactive_phone_backlog):
+            _txt = str(item.get("text", "")).strip()
+            if not _txt:
+                continue
+            await safe_send_json(ws, {
+                "type": "response",
+                "text": _txt,
+                "ai_latency_ms": 0,
+                "pipeline": "proactive_backlog",
+            })
+        _proactive_phone_backlog.clear()
+
     try:
         while True:
             msg = await ws.receive_text()
@@ -2758,6 +3409,64 @@ async def ws_chat(ws: WebSocket):
             if not text: continue
 
             now_ts = time.time()
+
+            if _match_special_cmd(text, "penta_off_command", "pentaoff"):
+                await safe_send_json(ws, {
+                    "type": "response",
+                    "text": "Đã nhận lệnh PentaOff. Em sẽ tắt server ngay bây giờ.",
+                    "ai_latency_ms": 0,
+                    "pipeline": "system_poweroff",
+                })
+                _schedule_server_shutdown(0.9)
+                continue
+
+            if _match_special_cmd(text, "penta_sleep_command", "pentasleep"):
+                if not _server_sleep_mode:
+                    _server_sleep_mode = True
+                    _server_sleep_started_ts = now_ts
+                    await safe_send_json(ws, {
+                        "type": "response",
+                        "text": "Đã vào PentaSleep. Em tạm ngủ và sẽ bỏ qua mọi câu cho tới khi anh gọi 'pentami'.",
+                        "ai_latency_ms": 0,
+                        "pipeline": "system_sleep_on",
+                    })
+                else:
+                    await safe_send_json(ws, {
+                        "type": "response",
+                        "text": "Em đang ở PentaSleep rồi nè anh.",
+                        "ai_latency_ms": 0,
+                        "pipeline": "system_sleep_on",
+                    })
+                continue
+
+            if _server_sleep_mode:
+                _wake_norm = str(text or "").strip().lower().replace(" ", "")
+                # Chấp nhận: "pentami", "pentamion", "bật pentami", "bat pentami"
+                is_wake = (_match_special_cmd(text, "penta_wake_command", "pentami") or 
+                           _wake_norm in {"pentamion", "pentami", "bậtpentami", "batpentami"})
+                if is_wake:
+                    _server_sleep_mode = False
+                    _server_sleep_started_ts = 0.0
+                    # Wake = bắt đầu một phiên làm việc mới, reset nhịp 2/4/6... và auto-sleep flag.
+                    _work_session_start_ts = now_ts
+                    _work_break_cycle_count = 0
+                    _auto_sleep_after_work_triggered = False
+                    interval = float(get("proactive_break_remind_interval_sec", 7200))
+                    _next_break_remind_ts = now_ts + max(300.0, interval)
+                    await safe_send_json(ws, {
+                        "type": "response",
+                        "text": "Em đã thức dậy từ PentaSleep rồi nha anh. Mình tiếp tục bình thường nhé.",
+                        "ai_latency_ms": 0,
+                        "pipeline": "system_sleep_off",
+                    })
+                else:
+                    await safe_send_json(ws, {
+                        "type": "response",
+                        "text": "Em đang ngủ (PentaSleep). Anh nhắn 'pentami' để đánh thức em nha.",
+                        "ai_latency_ms": 0,
+                        "pipeline": "system_sleep_blocked",
+                    })
+                continue
 
             # ── Idempotency dedup ────────────────────────────────────────────
             req_id = raw.get("request_id", "")
@@ -2773,8 +3482,7 @@ async def ws_chat(ws: WebSocket):
                 _seen_request_ids[req_id] = now_ts
 
             _last_user_interaction_ts = now_ts
-            if _work_session_start_ts is None:
-                _work_session_start_ts = now_ts
+            _init_work_session_timer(now_ts)
 
             # Cho phép client tự khai báo source="phone" để override IP detection
             if raw.get("source") == "phone" and not _active_ws_meta[ws]["is_phone"]:
@@ -2782,6 +3490,8 @@ async def ws_chat(ws: WebSocket):
 
             speed = float(raw.get("speed", 1.0)); speaker = raw.get("speaker") or str(get("chat_speaker", "NF")).strip() or "NF"; use_tts = raw.get("tts", True)
             mode = raw.get("mode", "chat")
+
+            # Auto-route CMD đã tắt: mode chỉ chuyển khi người dùng bật toggle/kéo sang CMD.
 
             # ── Backpressure guard ───────────────────────────────────────────
             _sem_acquired = False
@@ -2857,7 +3567,61 @@ async def ws_chat(ws: WebSocket):
                             if len(_recent_successful_commands) > 100:
                                 _recent_successful_commands.pop(0)
 
+                        # ── Special handler: setup action → Tuya power control ──────────────
+                        # PRIMARY: Check original user text for clear power + device intent (catches parsing errors)
+                        user_text_lower = text.lower()
+                        power_keywords_off = {"tắt", "tat", "shutdown", "off", "power off"}
+                        power_keywords_on = {"bật", "bat", "startup", "on", "power on"}
+                        device_keywords = {"pc", "may", "máy", "máy tính", "may tinh", "computer", "nguồn", "nguon", "power"}
+                        
+                        has_clear_off_intent = any(kw in user_text_lower for kw in power_keywords_off) and any(kw in user_text_lower for kw in device_keywords)
+                        has_clear_on_intent = any(kw in user_text_lower for kw in power_keywords_on) and any(kw in user_text_lower for kw in device_keywords)
+                        
+                        # Execute power control immediately when intent is clear.
+                        # This avoids bad LLM parses (e.g. "Tắt PC" -> setup volume 0) falling through to Tailscale.
+                        should_handle_power = (has_clear_off_intent or has_clear_on_intent) and get("tuya_device_id") and get("tuya_ip")
+                        
+                        if should_handle_power:
+                            try:
+                                outlet = get_outlet()
+                                if has_clear_off_intent:
+                                    outlet.turn_off()
+                                    resp_text = f"{_ai_prn.capitalize()} đã tắt ổ điện rồi nha {_usr_prn}. PC sẽ tắt trong vài giây."
+                                    pipeline = "cmd_tuya_off"
+                                    log.info(f"✅ [Tuya] Turned off outlet successfully for: {text}")
+                                elif has_clear_on_intent:
+                                    outlet.turn_on()
+                                    resp_text = f"{_ai_prn.capitalize()} đã bật ổ điện rồi nha {_usr_prn}. PC sẽ khởi động trong vài giây."
+                                    pipeline = "cmd_tuya_on"
+                                    log.info(f"✅ [Tuya] Turned on outlet successfully for: {text}")
+                                else:
+                                    # Should not reach here
+                                    raise Exception("Unknown power intent")
+                                
+                                await safe_send_json(ws, {
+                                    "type": "response",
+                                    "text": resp_text,
+                                    "ai_latency_ms": int((time.perf_counter() - t0) * 1000),
+                                    "pipeline": pipeline,
+                                })
+                                if use_tts:
+                                    await speak(resp_text, speaker=speaker, speed=speed, lang=_session_lang)
+                                continue
+                            except Exception as e:
+                                log.error(f"❌ [Tuya] Failed to control outlet: {e}")
+                                resp_text = f"{_ai_prn.capitalize()} không {'tắt' if has_clear_off_intent else 'bật'} được ổ điện {_usr_prn} ơi. Kiểm tra cấu hình Tuya xem sao."
+                                await safe_send_json(ws, {
+                                    "type": "response",
+                                    "text": resp_text,
+                                    "ai_latency_ms": int((time.perf_counter() - t0) * 1000),
+                                    "pipeline": "cmd_tuya_fail",
+                                })
+                                if use_tts:
+                                    await speak(resp_text, speaker=speaker, speed=speed, lang=_session_lang)
+                                continue
+
                         payload = _map_ollama_to_windows_payload(cmd_res)
+                        
                         _deferred_play_payload = None  # reset mỗi lượt
                         _local_play_sub = payload.get("_local_play", "")
                         if payload["cmd"] or payload["script"] or _local_play_sub:
@@ -2971,7 +3735,9 @@ async def ws_chat(ws: WebSocket):
 
                     s_state = _schedule_setup_state.setdefault(ws, {"active": False, "draft": empty_week_schedule(), "off_topic_hits": 0, "has_draft": False})
 
-                    if pipeline == "chat_promise":
+                    if pipeline != "unknown":
+                        pass
+                    elif pipeline == "chat_promise":
                         pass
                     elif (not s_state.get("active")) and is_schedule_resume(text) and s_state.get("has_draft"):
                         s_state["active"] = True
@@ -3072,7 +3838,6 @@ async def ws_chat(ws: WebSocket):
 
                         # ── PentaWiki toggle ────────────────────────────────────
                         elif _WIKI_AVAILABLE and _wiki_check_toggle(text):
-                            global _penta_wiki_mode
                             _wiki_action = _wiki_check_toggle(text)
                             _ai_prn_wt   = getattr(getattr(ai, "profile", None), "ai_pronoun", "em")
                             _usr_prn_wt  = getattr(getattr(ai, "profile", None), "user_call", "") or \
@@ -3113,7 +3878,7 @@ async def ws_chat(ws: WebSocket):
                             pipeline = "lang_toggle"
 
                         # ── PentaWiki query ─────────────────────────────────────
-                        elif _penta_wiki_mode and _WIKI_AVAILABLE and _wiki_is_query(text):
+                        elif _penta_wiki_mode and _WIKI_AVAILABLE and (_wiki_is_query(text) or _is_wiki_like_query(text)):
                             _ai_prn_wq  = getattr(getattr(ai, "profile", None), "ai_pronoun", "em")
                             _usr_prn_wq = getattr(getattr(ai, "profile", None), "user_call", "") or \
                                           getattr(getattr(ai, "profile", None), "pronoun", "anh")
@@ -3138,6 +3903,13 @@ async def ws_chat(ws: WebSocket):
                                 )
                             )
                             resp_text = _wiki_format(_wiki_res, _session_lang, _ai_prn_wq, _usr_prn_wq)
+                            if _wiki_res.get("ok"):
+                                resp_text = await _rewrite_wiki_answer_with_ollama(
+                                    question=text,
+                                    wiki_answer=resp_text,
+                                    lang=_session_lang,
+                                    ai=ai,
+                                )
                             # Nếu không tìm thấy → dùng thông báo không found, KHÔNG fallback ai.chat
                             pipeline = "wiki_result"
                             # Gắn danh sách chủ đề liên quan vào pipeline tag để WS gửi xuống client
@@ -3146,38 +3918,59 @@ async def ws_chat(ws: WebSocket):
                         # ── PentaMi mode ───────────────────────────────────────
                         elif _PENTAMI_AVAILABLE and _pentami_check_toggle(text):
                             toggle_action = _pentami_check_toggle(text)
-                            global _pentami_mode
                             pm = get_pentami_chat()
                             _ai_pronoun = getattr(getattr(ai, "profile", None), "ai_pronoun", "em")
                             _user_call  = getattr(getattr(ai, "profile", None), "user_call", "") or \
                                           getattr(getattr(ai, "profile", None), "pronoun", "anh")
                             if toggle_action == "on":
                                 _pentami_mode = True
-                                # Keepalive: không để Bonsai ngủ khi đang dùng PentaMi
+                                _pentami_thinking_mode = False
+                                if hasattr(pm, "set_bonsai_thinking_mode"):
+                                    pm.set_bonsai_thinking_mode(False)
+                                pm._bonsai.set_keepalive(False)
+                                pm._bonsai.set_sleep_notify(None)
+                                resp_text = (
+                                    f"Chế độ PentaMi đã bật rồi nha {_user_call}! "
+                                    f"{_ai_pronoun.capitalize()} đây, "
+                                    f"{_user_call} muốn tâm sự gì không nào?"
+                                )
+                            elif toggle_action == "on_thinking":
+                                _pentami_mode = True
+                                _pentami_thinking_mode = True
+                                if hasattr(pm, "set_bonsai_thinking_mode"):
+                                    pm.set_bonsai_thinking_mode(True)
                                 pm._bonsai.set_keepalive(True)
-                                # Đăng ký callback thông báo khi Bonsai vào sleep
                                 def _bonsai_sleep_notify(msg: str):
                                     asyncio.run_coroutine_threadsafe(
                                         broadcast_proactive(msg, init_ai()),
                                         asyncio.get_event_loop(),
                                     )
                                 pm._bonsai.set_sleep_notify(_bonsai_sleep_notify)
-                                # Pre-warm Bonsai ngầm trong background
                                 async def _prewarm():
                                     loop = asyncio.get_event_loop()
-                                    ready = await loop.run_in_executor(
-                                        None, pm._bonsai._ensure_awake
-                                    )
+                                    ready = await loop.run_in_executor(None, pm._bonsai._ensure_awake)
                                     if not ready:
-                                        log.warning("[PentaMi] Pre-warm Bonsai thất bại")
+                                        log.warning("[PentaMiT] Pre-warm Bonsai thất bại")
                                 asyncio.create_task(_prewarm())
                                 resp_text = (
-                                    f"Chế độ PentaMi đã bật rồi nha {_user_call}! "
-                                    f"{_ai_pronoun.capitalize()} đây, "
-                                    f"{_user_call} muốn tâm sự gì không nào?"
+                                    f"Đã bật PentaMiT rồi nha {_user_call}! "
+                                    f"{_ai_pronoun.capitalize()} sẽ tự dùng Bonsai cho câu khó/sâu để trả lời kỹ hơn."
+                                )
+                            elif toggle_action == "off_thinking":
+                                _pentami_thinking_mode = False
+                                if hasattr(pm, "set_bonsai_thinking_mode"):
+                                    pm.set_bonsai_thinking_mode(False)
+                                pm._bonsai.set_keepalive(False)
+                                pm._bonsai.set_sleep_notify(None)
+                                resp_text = (
+                                    f"Đã tắt PentaMiT nha {_user_call}. "
+                                    f"{_ai_pronoun.capitalize()} quay về trả lời nhanh bằng Ollama stream là chính."
                                 )
                             elif toggle_action == "off":
                                 _pentami_mode = False
+                                _pentami_thinking_mode = False
+                                if hasattr(pm, "set_bonsai_thinking_mode"):
+                                    pm.set_bonsai_thinking_mode(False)
                                 pm._bonsai.set_keepalive(False)
                                 pm._bonsai.set_sleep_notify(None)
                                 # Xoá context hội thoại khi tắt, giữ lại kiến thức đã học
@@ -3210,26 +4003,63 @@ async def ws_chat(ws: WebSocket):
                                 "pipeline": "pentami_thinking",
                             })
                             # Nếu Bonsai đang khởi động (chưa ready), báo người dùng trước
-                            if not pm._bonsai.is_available():
-                                await safe_send_json(ws, {
-                                    "type": "response",
-                                    "text": f"{_ai_p.capitalize()} đang thức dậy, {_ai_p} cần chút để khởi động GPU né, {_ai_p} sẽ trả lời ngay sau đó nhé...",
-                                    "ai_latency_ms": 0,
-                                    "emotional_state": "normal",
-                                    "hormone_levels": {},
-                                    "pipeline": "pentami_waking",
-                                })
+                            if _pentami_thinking_mode and (not pm._bonsai.is_available()):
+                                if hasattr(pm._bonsai, "can_wake_now") and (not pm._bonsai.can_wake_now()):
+                                    await safe_send_json(ws, {
+                                        "type": "response",
+                                        "text": f"{_ai_p.capitalize()} đang lỗi khởi động Bonsai nên tạm nghỉ thử lại một chút nha {_u_p}. Trong lúc này {_ai_p} vẫn sẽ cố trả lời bằng chế độ nhẹ.",
+                                        "ai_latency_ms": 0,
+                                        "emotional_state": "normal",
+                                        "hormone_levels": {},
+                                        "pipeline": "pentami_bonsai_retry_wait",
+                                    })
+                                else:
+                                    await safe_send_json(ws, {
+                                        "type": "response",
+                                        "text": f"{_ai_p.capitalize()} đang thức dậy, {_ai_p} cần chút để khởi động GPU né, {_ai_p} sẽ trả lời ngay sau đó nhé...",
+                                        "ai_latency_ms": 0,
+                                        "emotional_state": "normal",
+                                        "hormone_levels": {},
+                                        "pipeline": "pentami_waking",
+                                    })
                             try:
+                                resp_text, _pentami_timed_out, _pentami_route = await _stream_pentami_tokens(
+                                    ws,
+                                    pm,
+                                    text,
+                                    timeout_sec=55.0,
+                                )
+                            except Exception as _pentami_stream_err:
+                                log.warning(f"[PentaMi] stream failed, fallback to blocking chat: {_pentami_stream_err}")
                                 resp_text = await asyncio.wait_for(
                                     asyncio.get_event_loop().run_in_executor(None, pm.chat, text),
                                     timeout=55.0,
                                 )
-                            except asyncio.TimeoutError:
+                                _pentami_timed_out = False
+                                _pentami_route = "bonsai"
+
+                            if hasattr(pm, "postprocess_output") and resp_text.strip():
+                                try:
+                                    resp_text = pm.postprocess_output(resp_text)
+                                except Exception:
+                                    pass
+                            if _pentami_timed_out:
                                 resp_text = (
                                     f"{_ai_p.capitalize()} xin lỗi {_u_p}, "
                                     f"{_ai_p} suy nghĩ lâu quá mà chưa kịp — {_u_p} thử lại sau nhé!"
                                 )
-                            pipeline = "pentami_bonsai"
+                            elif not resp_text.strip():
+                                resp_text = (
+                                    f"{_ai_p.capitalize()} chưa bật được Bonsai nên chưa phân tích sâu được câu này. "
+                                    f"{_u_p} chờ {_ai_p} một chút rồi thử lại giúp {_ai_p} nha."
+                                )
+                            _route_map = {
+                                "ollama_fast": "pentami_fast_ollama",
+                                "ollama_fallback": "pentami_ollama_fallback",
+                                "bonsai_fallback": "pentami_bonsai_fallback",
+                                "bonsai": "pentami_bonsai",
+                            }
+                            pipeline = _route_map.get(str(_pentami_route), "pentami_bonsai")
 
                         else:
                             proactive_followup = await _maybe_reply_contextual_care(text, ai, now_ts)
@@ -3269,6 +4099,7 @@ async def ws_chat(ws: WebSocket):
             if not resp_text:
                 resp_text = "Dạ, em xong rồi ạ."
             resp_text = _enforce_profile_pronouns(resp_text, ai)
+            resp_text = _repair_vi_pronoun_subjects(resp_text, ai)
             ai_ms = int((time.perf_counter() - t0) * 1000)
 
             em = ai.emotion.hormone.get_emotional_state() if hasattr(ai, 'emotion') else "normal"

@@ -20,6 +20,7 @@ import os
 import importlib
 import importlib.util
 import logging
+import inspect
 from typing import Optional, Dict, Any, List
 
 log = logging.getLogger("SkillManager")
@@ -107,7 +108,14 @@ class SkillManager:
             mod  = entry["module"]
             name = entry["meta"]["name"]
             try:
-                if mod.check_intent(text):
+                check_intent = getattr(mod, "check_intent")
+                try:
+                    params = inspect.signature(check_intent).parameters
+                    matched = bool(check_intent(text, ctx)) if len(params) >= 2 else bool(check_intent(text))
+                except (TypeError, ValueError):
+                    matched = bool(check_intent(text))
+
+                if matched:
                     log.info(f"[SkillManager] '{text[:40]}' → skill: {name}")
                     result = mod.run(text, ctx)
                     if isinstance(result, dict) and result.get("response"):

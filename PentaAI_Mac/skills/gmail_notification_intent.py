@@ -18,7 +18,7 @@ log = logging.getLogger("Skill.GmailNotif")
 
 SKILL_META: Dict[str, Any] = {
     "name": "GmailNotificationIntent",
-    "version": "1.2",
+    "version": "1.3",
     "description": "Xử lý lệnh Gmail notification như bật/tắt, kiểm tra tin nhắn",
     "author": "PentaAI",
     "enabled": True,
@@ -45,6 +45,8 @@ _RE_DISABLE = re.compile(
 
 _RE_CHECK = re.compile(
     r"\b(có|kiểm\s*tra|xem)\s+(tin\s*nhắn|email|mail|gmail).*(nào|không|gì|chưa)"
+    r"|\b(kiểm\s*tra|xem|check)\s*(gmail|mail|email)\b"
+    r"|\b(gmail|mail|email)\s*(check|kiểm\s*tra)\b"
     r"|\btin\s*nhắn\s*nào\s*mới\b"
     r"|\bemail\s*nào\s*chưa\s*đọc\b"
     r"|\bqueue\s*gmail\b"
@@ -85,18 +87,19 @@ _NO_EXACT = {
 
 # ── Public Interface ───────────────────────────────────────────────────────────
 
-def check_intent(text: str) -> bool:
-    """Check if text is a Gmail notification command."""
-    is_yes = _is_short_confirmation(text, positive=True)
-    is_no = _is_short_confirmation(text, positive=False)
-    return bool(
-        _RE_ENABLE.search(text)
-        or _RE_DISABLE.search(text)
-        or _RE_CHECK.search(text)
-        or _RE_CLEAR.search(text)
-        or is_yes
-        or is_no
-    )
+def check_intent(text: str, context: Dict[str, Any] = None) -> bool:
+    """Check if text is a Gmail notification command.
+
+    Yes/No chỉ được coi là Gmail intent khi thực sự đang có email chờ xác nhận,
+    tránh cướp mất các câu trả lời ngắn của ngữ cảnh hội thoại khác.
+    """
+    if _RE_ENABLE.search(text) or _RE_DISABLE.search(text) or _RE_CHECK.search(text) or _RE_CLEAR.search(text):
+        return True
+
+    if _is_short_confirmation(text, positive=True) or _is_short_confirmation(text, positive=False):
+        return _has_pending_gmail_confirmation()
+
+    return False
 
 
 def run(text: str, context: Dict[str, Any] = None) -> Dict[str, Any]:
@@ -131,10 +134,10 @@ def run(text: str, context: Dict[str, Any] = None) -> Dict[str, Any]:
     if _RE_CLEAR.search(text):
         return _handle_clear(lang, ai_prn, user_call)
     
-    if _is_short_confirmation(text, positive=True):
+    if _is_short_confirmation(text, positive=True) and _has_pending_gmail_confirmation():
         return _handle_yes(lang, ai_prn, user_call)
     
-    if _is_short_confirmation(text, positive=False):
+    if _is_short_confirmation(text, positive=False) and _has_pending_gmail_confirmation():
         return _handle_no(lang, ai_prn, user_call)
     
     return {
@@ -256,6 +259,17 @@ def _handle_no(lang: str, ai_prn: str, user_call: str) -> Dict[str, Any]:
 def _t(lang: str, vi: str = "", en: str = "", ja: str = "") -> str:
     """Translate by language."""
     return {"vi": vi, "en": en, "ja": ja}.get(lang, vi)
+
+
+def _has_pending_gmail_confirmation() -> bool:
+    """Chỉ cho yes/no đi vào Gmail flow khi daemon đang có mail chờ trả lời."""
+    try:
+        from services.gmail_notification_daemon import get_daemon
+
+        daemon = get_daemon()
+        return daemon is not None and daemon.get_oldest_waiting_uid() is not None
+    except Exception:
+        return False
 
 
 def _is_short_confirmation(text: str, positive: bool) -> bool:

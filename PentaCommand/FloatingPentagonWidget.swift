@@ -44,6 +44,8 @@ struct FloatingPentagonWidget: View {
     @State private var sentenceTimer     : Timer?          // timer reveal câu tiếp theo
     @State private var isReceivingText   : Bool     = false // đang nhận text từ AI
     @State private var scrollProxy       : ScrollViewProxy? = nil
+    @State private var streamIdleTimer   : Timer?
+    @State private var lastSourceText    : String   = ""
 
     // ── Keyboard ─────────────────────────────────────────────────────────
     @State private var inputText     : String  = ""
@@ -106,18 +108,27 @@ struct FloatingPentagonWidget: View {
             // Khi nhận text từ AI → reveal từng câu với hiệu ứng streaming
             .onChange(of: voiceEngine.aiResponseText) { _, newText in
                 guard !newText.isEmpty else { return }
-                triggerAIGlow()
                 revealAndShowPanel()
-                startSentenceStream(newText)
+                let isIncremental = !lastSourceText.isEmpty && newText.hasPrefix(lastSourceText)
+                if lastSourceText.isEmpty || !isIncremental {
+                    triggerAIGlow()
+                    startSentenceStream(newText)
+                } else {
+                    applyIncrementalStream(newText)
+                }
+                lastSourceText = newText
+                scheduleStreamIdleReset()
             }
             // Khi bắt đầu gửi câu hỏi mới → xóa text cũ, hiện "đang xử lý..."
             .onChange(of: voiceEngine.voiceState) { _, state in
                 if state == .executing || state == .responding {
                     if voiceEngine.aiResponseText.isEmpty {
                         sentenceTimer?.invalidate()
+                        streamIdleTimer?.invalidate()
                         pendingSentences = []
                         displayedText    = ""
                         isReceivingText  = false
+                        lastSourceText   = ""
                     }
                 }
             }
@@ -595,12 +606,17 @@ struct FloatingPentagonWidget: View {
         revealNextSentence()
     }
 
+    func applyIncrementalStream(_ fullText: String) {
+        sentenceTimer?.invalidate()
+        pendingSentences = []
+        withAnimation(.easeIn(duration: 0.1)) {
+            displayedText = fullText
+            isReceivingText = true
+        }
+    }
+
     func revealNextSentence() {
         guard !pendingSentences.isEmpty else {
-            // Hết câu → tắt cursor sau 0.8s
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-                withAnimation(.easeOut(duration: 0.3)) { isReceivingText = false }
-            }
             return
         }
 
@@ -616,6 +632,15 @@ struct FloatingPentagonWidget: View {
         let delay: TimeInterval = pendingSentences.isEmpty ? 0 : min(0.35, Double(sentence.count) * 0.008 + 0.18)
         sentenceTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { _ in
             revealNextSentence()
+        }
+    }
+
+    func scheduleStreamIdleReset() {
+        streamIdleTimer?.invalidate()
+        streamIdleTimer = Timer.scheduledTimer(withTimeInterval: 0.45, repeats: false) { _ in
+            withAnimation(.easeOut(duration: 0.2)) {
+                isReceivingText = false
+            }
         }
     }
 

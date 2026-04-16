@@ -17,6 +17,7 @@ private extension Color {
 }
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var voiceEngine  = VoiceEngine()
     @StateObject private var commandStore = CommandStore()
     @State private var showSettings = false
@@ -76,6 +77,16 @@ struct ContentView: View {
         }
         .onChange(of: voiceEngine.voiceState) { newState in
             syncAnimations(to: newState)
+        }
+        .onChange(of: scenePhase) { phase in
+            switch phase {
+            case .active:
+                voiceEngine.appDidBecomeActive()
+            case .background, .inactive:
+                voiceEngine.appDidEnterBackground()
+            @unknown default:
+                break
+            }
         }
     }
 

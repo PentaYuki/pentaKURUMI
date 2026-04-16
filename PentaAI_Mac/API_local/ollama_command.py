@@ -165,8 +165,10 @@ _DIRECT_RUN_APPS: Dict[str, str] = {
     "photos": "Photos",
     "anh": "Photos",
     "ảnh": "Photos",
-    "hinh": "Photos",
-    "hình": "Photos",
+    # System aliases
+    "volum": "volume",
+    "am luong": "volume",
+    "âm lượng": "volume",
 }
 
 # Filler words từ voice recognition hay nói trước lệnh thật
@@ -204,6 +206,22 @@ _RE_PLAY = re.compile(
 )
 _RE_CLOSE_WINDOW = re.compile(
     r'^(?:đóng|dong|tắt|tat|close)\s+(?:đúng\s+)?(?:cửa\s*sổ|cua\s*so|window)\s+(.+)$',
+    re.IGNORECASE,
+)
+_RE_VOLUME = re.compile(
+    r'^(?:tăng|giam|giảm|tắt|tat|mở|mo|bật|bat|set|chỉnh)\s+(?:âm\s*lượng|am\s*luong|tiếng|tieng|volume)(?:\s+(?:lên|xuống|thêm|bot|bớt|sang))?\s*(\d+)?%?$',
+    re.IGNORECASE,
+)
+_RE_MEDIA_CONTROL = re.compile(
+    r'^(?:dừng|dung|ngừng|ngung|tắt|tat|stop|tiếp\s*tục|tiep\s*tuc|resume|tiếp|tiep|next|qua|bài\s*mới|bai\s*moi|quay\s*lại|quay\s*lai|back|previous)\s+(?:nhạc|nhac|video|phim)?\s*$',
+    re.IGNORECASE,
+)
+_RE_SCREENSHOT = re.compile(
+    r'^(?:chụp|chup)\s+(?:ảnh\s+)?(?:màn\s*hình|man\s*hinh|screenshot)\s*$',
+    re.IGNORECASE,
+)
+_RE_WEATHER_TIME = re.compile(
+    r'^(?:thời\s*tiết|thoi\s*tiet|mấy\s*giờ|may\s*gio|giờ\s*này|gio\s*nay|hôm\s*nay|hom\s*nay)\s*.*$',
     re.IGNORECASE,
 )
 
@@ -336,6 +354,27 @@ class OllamaCommandInterpreter:
         self.cloud_local_timeout = float(
             os.getenv("OLLAMA_CLOUD_LOCAL_TIMEOUT") or cfg.get("ollama_cloud_local_timeout", 35)
         )
+        # Callback được gọi TRƯỚC khi MLX Qwen2.5-7B bắt đầu suy luận (để UI thông báo).
+        # Caller tự set/reset sau mỗi lần dùng.
+        self.bonsai_notify_cb = None  # type: Optional[callable]
+
+        # ── MLX-vLLM Qwen2.5-7B (Tier 2: giữa Ollama 1B và Cloud) ───────────────
+        # bonsai_enabled key giữ lại cho backward compat với config.json cũ
+        self.bonsai_enabled = _to_bool(
+            os.getenv("BONSAI_ENABLED", cfg.get("mlx_enabled", cfg.get("bonsai_enabled", True))),
+            default=True,
+        )
+        if self.bonsai_enabled:
+            try:
+                from .mlx_client import get_mlx_client
+                from .bonsai_client import get_bonsai_client
+                self._bonsai = get_bonsai_client()
+            except Exception as _e:
+                log.warning(f"[Bonsai] Không load được bonsai_client: {_e}")
+                self._bonsai = None
+        else:
+            self._bonsai = None
+
         self.enable_cloud_fallback = _to_bool(
             os.getenv("OLLAMA_ENABLE_CLOUD_FALLBACK", cfg.get("ollama_enable_cloud_fallback", True)),
             default=True,
@@ -352,25 +391,6 @@ class OllamaCommandInterpreter:
         self._available: Optional[bool] = None
         self._last_check: float = 0.0
         self._sector_resolver = ActionExecutor()
-
-        # Callback được gọi TRƯỚC khi Bonsai-8B bắt đầu suy luận (để UI thông báo).
-        # Caller tự set/reset sau mỗi lần dùng.
-        self.bonsai_notify_cb = None  # type: Optional[callable]
-
-        # ── Bonsai-8B (Tier 2: giữa Ollama 1B và Cloud) ───────────────────────
-        self.bonsai_enabled = _to_bool(
-            os.getenv("BONSAI_ENABLED", cfg.get("bonsai_enabled", True)),
-            default=True,
-        )
-        if self.bonsai_enabled:
-            try:
-                from .bonsai_client import get_bonsai_client
-                self._bonsai = get_bonsai_client()
-            except Exception as _e:
-                log.warning(f"[Bonsai] Không load được bonsai_client: {_e}")
-                self._bonsai = None
-        else:
-            self._bonsai = None
 
         # ── Circuit Breaker (Tier 3 Cloud) ────────────────────────────────────
         self._cb_fails: int = 0
@@ -465,10 +485,11 @@ class OllamaCommandInterpreter:
         )
 
     def _call_bonsai(self, messages: List[Dict], max_tokens: Optional[int] = None) -> Optional[str]:
-        """Gọi Bonsai-8B tier 2. Tự động wake nếu đang sleep. Trả về string thô hoặc None."""
+        """Gọi MLX Qwen2.5-7B tier 2 (qua _bonsai alias). Trả về string thô hoặc None."""
         if not getattr(self, "_bonsai", None) or not self.bonsai_enabled:
             return None
-        return self._bonsai.chat(messages, max_tokens=max_tokens or self.command_max_tokens)
+        result, _ = self._bonsai.chat(messages, max_tokens=max_tokens or self.command_max_tokens)
+        return result
 
     def _call_ollama_model(
         self,
@@ -477,24 +498,44 @@ class OllamaCommandInterpreter:
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
     ) -> Optional[str]:
-        """Gọi model bất kỳ qua Ollama local API (/api/chat)."""
+        """Gọi model bất kỳ qua Ollama local API (/api/chat).
+
+        keep_alive="10m" giữ model trong RAM 10 phút sau mỗi call,
+        loại bỏ cold-start delay (~1.4s) khi model bị unload.
+        """
         try:
             payload = {
                 "model": model_name,
                 "messages": messages,
                 "stream": False,
+                "keep_alive": "10m",      # ← giữ model trong RAM 10 phút
                 "options": {
                     "temperature": self.temperature,
                     "num_predict": int(max_tokens or self.command_max_tokens),
                 },
             }
+            t0 = time.monotonic()
             r = requests.post(
                 f"{self.ollama_url}/api/chat",
                 json=payload,
                 timeout=timeout or self.local_timeout,
             )
             r.raise_for_status()
-            return r.json()["message"]["content"].strip()
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            data = r.json()
+            content = data["message"]["content"].strip()
+            # Log breakdown để dễ debug: load / prompt_eval / generation
+            ld  = data.get("load_duration", 0) // 1_000_000
+            pe  = data.get("prompt_eval_duration", 0) // 1_000_000
+            ed  = data.get("eval_duration", 0) // 1_000_000
+            ec  = data.get("eval_count", 0)
+            tps = round(ec / max(ed / 1000, 0.001), 1) if ec else 0
+            log.debug(
+                f"[Ollama:{model_name}] total={elapsed_ms}ms "
+                f"load={ld}ms pe={pe}ms gen={ed}ms "
+                f"tokens={ec} speed={tps}tok/s"
+            )
+            return content
         except Exception as e:
             log.warning(f"[Local/Ollama:{model_name}] error: {e}")
             return None
@@ -601,7 +642,7 @@ class OllamaCommandInterpreter:
             if resp:
                 return _strip_reasoning_artifacts(resp)
 
-        # Tier 2: Bonsai-8B (tự động wake nếu đang sleep)
+        # Tier 2: MLX Qwen2.5-7B (embedded, không cần wake-up)
         if getattr(self, "_bonsai", None) and self.bonsai_enabled:
             resp = self._call_bonsai(messages, max_tokens=self.chat_max_tokens)
             if resp:
@@ -764,6 +805,45 @@ class OllamaCommandInterpreter:
                 log.info(f"[Direct] close window title exactly '{title}'")
                 return {"action": "close_window", "target": "window", "query": title, "source": "direct"}
 
+        # ── System: Âm lượng (tắt/mở/tăng/giảm) ──────────────────────────────
+        m_vol = _RE_VOLUME.match(t)
+        if m_vol:
+            val = m_vol.group(1) or ""
+            act_text = t.lower()
+            target_val = "50" # default
+            if "tắt" in act_text or "tat" in act_text: target_val = "0"
+            elif "tăng" in act_text: target_val = str(int(val) if val else "+20")
+            elif "giảm" in act_text or "giam" in act_text: target_val = str("-" + val if val else "-20")
+            elif val: target_val = val
+            
+            log.info(f"[Direct] volume control -> {target_val}")
+            return {"action": "setup", "target": "volume", "query": target_val, "source": "direct"}
+
+        # ── Media Control (Dừng/Tiếp/Qua bài) ────────────────────────────────
+        m_media = _RE_MEDIA_CONTROL.match(t)
+        if m_media:
+            act_text = t.lower()
+            cmd = "play_pause"
+            if any(x in act_text for x in ["dừng", "stop", "ngừng", "tắt"]): cmd = "media_stop"
+            elif any(x in act_text for x in ["tiếp", "next", "qua"]): cmd = "media_next"
+            elif any(x in act_text for x in ["quay", "back", "prev"]): cmd = "media_prev"
+            
+            log.info(f"[Direct] media control -> {cmd}")
+            return {"action": "setup", "target": "media", "query": cmd, "source": "direct"}
+
+        # ── Screenshot ───────────────────────────────────────────────────────
+        if _RE_SCREENSHOT.match(t):
+            log.info("[Direct] screenshot requested")
+            return {"action": "setup", "target": "screenshot", "query": "now", "source": "direct"}
+
+        # ── Weather / Time (Dùng setup target để Mac/Windows tự xử lý) ──────
+        m_wt = _RE_WEATHER_TIME.match(t)
+        if m_wt:
+            q = t.strip()
+            dest = "weather" if "thời" in q or "tiet" in q else "time"
+            log.info(f"[Direct] fast-path for {dest}")
+            return {"action": "setup", "target": dest, "query": q, "source": "direct"}
+
         return None
 
     def interpret(
@@ -782,14 +862,15 @@ class OllamaCommandInterpreter:
         if not text or not text.strip():
             return {"error": "Câu lệnh trống"}
 
-        # ── 0. Tra cứu trực tiếp (không cần Ollama) ───────────────────────────
-        direct = self._try_rule_based_parse(text)
-        if direct:
-            return direct
-
+        # ── 0. Tra cứu Sector Shortcut (Ưu tiên cao nhất từ user) ────────────
         sector_shortcut = self._try_sector_shortcut(text)
         if sector_shortcut:
             return sector_shortcut
+
+        # ── 1. Tra cứu trực tiếp (Built-in apps/urls) ───────────────────────
+        direct = self._try_rule_based_parse(text)
+        if direct:
+            return direct
 
         # Tạo phần danh sách lệnh đã biết (nếu có)
         known_section = ""
@@ -916,13 +997,13 @@ class OllamaCommandInterpreter:
 
         if prefer_local and not self.allow_cloud_for_simple:
             return {
-                "error": "Ollama 1B và Bonsai-8B thất bại; cloud bị tắt cho lệnh đơn giản",
+                "error": "Ollama 1B và MLX Qwen2.5-7B thất bại; cloud bị tắt cho lệnh đơn giản",
                 "raw": raw_content or "",
             }
 
         # ── Cả ba tầng đều thất bại ──────────────────────────────────────────
         return {
-            "error": "Không thể phân tích lệnh (Ollama 1B, Bonsai-8B, và cloud đều thất bại)",
+            "error": "Không thể phân tích lệnh (Ollama 1B, MLX Qwen2.5-7B, và cloud đều thất bại)",
             "raw": raw_content or "",
         }
 

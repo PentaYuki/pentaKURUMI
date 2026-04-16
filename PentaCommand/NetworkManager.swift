@@ -92,6 +92,7 @@ class Penta​NetworkManager: NSObject, ObservableObject, AVAudioPlayerDelegate 
     private var wsConnected      : Bool = false
     private var wsReconnectCount : Int  = 0
     private var receiveGeneration: Int  = 0
+    private var currentStreamText: String = ""
 
     // AVAudioEngine streaming
     private var audioEngine   = AVAudioEngine()
@@ -374,6 +375,7 @@ class Penta​NetworkManager: NSObject, ObservableObject, AVAudioPlayerDelegate 
         }
 
         receiveGeneration += 1
+        currentStreamText = ""
         let gen = receiveGeneration
         receiveLoop(generation: gen, onText: onText, onError: onError)
     }
@@ -407,13 +409,32 @@ class Penta​NetworkManager: NSObject, ObservableObject, AVAudioPlayerDelegate 
                     let type = obj["type"] as? String ?? ""
 
                     switch type {
+                    case "token":
+                        let delta = obj["text"] as? String ?? ""
+                        if !delta.isEmpty {
+                            DispatchQueue.main.async {
+                                self.currentStreamText += delta
+                                self.lastResponseText = self.currentStreamText
+                                onText(self.currentStreamText, 0)
+                            }
+                        }
+                        self.receiveLoop(generation: generation, onText: onText, onError: onError)
+
                     case "response", "text":
                         let txt = obj["text"] as? String ?? ""
                         let ms  = obj["ai_latency_ms"] as? Int ?? 0
+                        let pipeline = obj["pipeline"] as? String ?? ""
                         DispatchQueue.main.async {
-                            self.lastResponseText = txt
-                            self.lastLatencyMs    = ms
-                            onText(txt, ms)
+                            let resolvedText: String
+                            if !self.currentStreamText.isEmpty && pipeline.hasPrefix("pentami") {
+                                resolvedText = self.currentStreamText
+                            } else {
+                                resolvedText = txt
+                                self.currentStreamText = txt
+                            }
+                            self.lastResponseText = resolvedText
+                            if ms > 0 { self.lastLatencyMs = ms }
+                            onText(resolvedText, ms)
                         }
                         self.receiveLoop(generation: generation, onText: onText, onError: onError)
 
@@ -444,7 +465,7 @@ class Penta​NetworkManager: NSObject, ObservableObject, AVAudioPlayerDelegate 
                         self.receiveLoop(generation: generation, onText: onText, onError: onError)
 
                     case "error":
-                        let msg = obj["msg"] as? String ?? "server error"
+                        let msg = obj["msg"] as? String ?? obj["text"] as? String ?? "server error"
                         DispatchQueue.main.async { onError(msg) }
                         self.receiveLoop(generation: generation, onText: onText, onError: onError)
 
@@ -909,6 +930,21 @@ class Penta​NetworkManager: NSObject, ObservableObject, AVAudioPlayerDelegate 
             self?.ping { ok in DispatchQueue.main.async { self?.isConnected = ok } }
         }
         ping { [weak self] ok in DispatchQueue.main.async { self?.isConnected = ok } }
+    }
+
+    // MARK: - App Lifecycle
+
+    func appDidEnterBackground() {
+        disconnectWebSocket()
+    }
+
+    func appDidBecomeActive() {
+        ensureConnected()
+        ping { [weak self] ok in
+            DispatchQueue.main.async {
+                self?.isConnected = ok
+            }
+        }
     }
 
     // MARK: - AVAudioPlayerDelegate

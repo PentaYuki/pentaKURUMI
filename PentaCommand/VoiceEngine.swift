@@ -227,10 +227,15 @@ class VoiceEngine: NSObject, ObservableObject {
             mode:    wsMode,
             onText:  { [weak self] responseText, latencyMs in
                 guard let self else { return }
+                let shouldHaptic = self.aiResponseText.isEmpty && !responseText.isEmpty
                 self.aiResponseText = responseText
-                self.lastLatencyMs  = latencyMs
+                if latencyMs > 0 {
+                    self.lastLatencyMs = latencyMs
+                }
                 self.statusMessage  = "✓ \(responseText.prefix(40))…"
-                self.haptic(.medium)
+                if shouldHaptic {
+                    self.haptic(.medium)
+                }
             },
             onError: { [weak self] err in
                 guard let self else { return }
@@ -258,6 +263,35 @@ class VoiceEngine: NSObject, ObservableObject {
         // Thin client: app chỉ chọn mode (chat/cmd), backend chịu trách nhiệm xử lý.
         sendTextToAI(text)
     }
+
+    // MARK: - App Lifecycle
+
+    func appDidEnterBackground() {
+        networkManager.appDidEnterBackground()
+        cancelTimers()
+        if isListening {
+            recognitionPaused = true
+            sessionGeneration += 1
+            audioEngine.inputNode.removeTap(onBus: 0)
+            recognitionRequest?.endAudio()
+            recognitionTask?.cancel()
+            recognitionRequest = nil
+            recognitionTask = nil
+        }
+    }
+
+    func appDidBecomeActive() {
+        networkManager.appDidBecomeActive()
+        guard isListening else { return }
+        recognitionPaused = false
+        do {
+            try setupAudioSession()
+            try beginRecognitionSession()
+        } catch {
+            statusMessage = "Không khôi phục được microphone: \(error.localizedDescription)"
+        }
+    }
+
     // MARK: - ⭐ Audio Session (FIX v3.1)
 
     /// Setup audio session với speaker override bắt buộc.

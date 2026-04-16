@@ -23,7 +23,7 @@ class CommandStore: ObservableObject {
         if commands.isEmpty {
             loadDefaults()
         }
-    }
+    } 
     
     private func loadDefaults() {
         commands = [

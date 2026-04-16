@@ -1,5 +1,12 @@
-import redis
-import faiss
+try:
+    import redis
+except Exception:
+    redis = None  # type: ignore
+
+try:
+    import faiss
+except Exception:
+    faiss = None  # type: ignore
 import numpy as np
 import requests
 import json
@@ -18,9 +25,14 @@ class PentaMemory:
         # Circuit breaker: tránh gọi Ollama khi biết nó không chạy
         self._ollama_ok: Optional[bool] = None
         self._ollama_last_check: float = 0
+        self.short_history_turns: int = 6
+        self.memory_top_k: int = 3
+        self.memory_distance_threshold: float = 1.15
 
         # 1. Khởi tạo Redis (Ngắn hạn)
         try:
+            if redis is None:
+                raise RuntimeError("redis package not installed")
             self.redis = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
             self.redis.ping()
             log.info("✅ Redis Memory: OK")
@@ -30,9 +42,10 @@ class PentaMemory:
 
         # 2. Khởi tạo Faiss (Dài hạn)
         self.dimension = 768
-        self.faiss_index = faiss.IndexFlatL2(self.dimension)
+        self.faiss_index = faiss.IndexFlatL2(self.dimension) if faiss is not None else None
         self.vault: Dict[int, str] = {}
-        self.vault_file = "penta_vault.json"
+        _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.vault_file = os.path.join(_root, "data", "penta_vault.json")
         self._load_vault()
         self._reminder_variants: List[str] = []
 
@@ -65,8 +78,60 @@ class PentaMemory:
                     data = json.load(f)
                     for item in data:
                         self.vault[item['id']] = item['text']
+                self._rebuild_faiss_index(max_items=200)
             except Exception as e:
                 log.error(f"Lỗi load Vault: {e}")
+
+    def _save_vault(self):
+        try:
+            os.makedirs(os.path.dirname(self.vault_file), exist_ok=True)
+            payload = [{"id": int(i), "text": str(t)} for i, t in self.vault.items()]
+            with open(self.vault_file, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            log.debug(f"Vault save skipped: {e}")
+
+    def _rebuild_faiss_index(self, max_items: int = 200):
+        if self.faiss_index is None or faiss is None or not self.vault:
+            return
+        try:
+            self.faiss_index = faiss.IndexFlatL2(self.dimension)
+            count = 0
+            for idx in sorted(self.vault.keys()):
+                txt = self.vault.get(idx, "")
+                if not txt:
+                    continue
+                vec = self.get_embedding(txt)
+                if vec is not None and vec.shape[-1] == self.dimension:
+                    self.faiss_index.add(vec)
+                    count += 1
+                if count >= max_items:
+                    break
+            log.info(f"[PentaMemory] FAISS rebuilt: {count} vectors")
+        except Exception as e:
+            log.debug(f"Rebuild FAISS skipped: {e}")
+
+    def _retrieve_long_term_memories(self, text: str, top_k: Optional[int] = None) -> List[str]:
+        if self.faiss_index is None or self.faiss_index.ntotal == 0:
+            return []
+        vec = self.get_embedding(text)
+        if vec is None:
+            return []
+        k = int(top_k or self.memory_top_k)
+        try:
+            dist, idx = self.faiss_index.search(vec, k)
+            out: List[str] = []
+            for d, i in zip(dist[0], idx[0]):
+                if i == -1:
+                    continue
+                if float(d) > float(self.memory_distance_threshold):
+                    continue
+                txt = self.vault.get(int(i), "")
+                if txt and txt not in out:
+                    out.append(txt)
+            return out
+        except Exception:
+            return []
 
     def get_embedding(self, text: str):
         if not self._check_ollama():
@@ -91,22 +156,16 @@ class PentaMemory:
         history = []
         if self.redis:
             try:
-                raw_hist = self.redis.lrange(session_id, 0, 5)
+                raw_hist = self.redis.lrange(session_id, 0, max(2 * self.short_history_turns - 1, 0))
                 history = [json.loads(m) for m in reversed(raw_hist)]
             except Exception:
                 pass
 
         # B. Lấy ngữ cảnh dài hạn (Faiss)
         past_info = ""
-        if self.faiss_index.ntotal > 0:
-            vec = self.get_embedding(user_text)
-            if vec is not None:
-                try:
-                    dist, idx = self.faiss_index.search(vec, 1)
-                    if idx[0][0] != -1 and dist[0][0] < 1.0:
-                        past_info = self.vault.get(idx[0][0], "")
-                except Exception:
-                    pass
+        recalls = self._retrieve_long_term_memories(user_text)
+        if recalls:
+            past_info = "\n- " + "\n- ".join(recalls)
 
         # C. Xây dựng Prompt "Siêu Dễ Thương"
         # Lấy cách AI gọi người dùng từ profile nếu có
@@ -117,7 +176,7 @@ class PentaMemory:
             "Bạn luôn lo lắng cho sức khỏe và niềm vui của Anh. Trả lời ngắn gọn, tự nhiên, tràn đầy cảm xúc bằng tiếng Việt."
         )
         if past_info:
-            sys_prompt += f"\n[KÝ ỨC CỦA CHÚNG TA]: {past_info}"
+            sys_prompt += f"\n[KÝ ỨC CỦA CHÚNG TA]{past_info}"
 
         messages = [{"role": "system", "content": sys_prompt}]
         messages.extend(history)
@@ -235,7 +294,7 @@ class PentaMemory:
             if "{msg}" in local_pick:
                 return local_pick
 
-        if self.faiss_index.ntotal == 0:
+        if self.faiss_index is None or self.faiss_index.ntotal == 0:
             return default_text
         
         vec = self.get_embedding(intent)
@@ -260,9 +319,10 @@ class PentaMemory:
             return
         idx = len(self.vault)
         self.vault[idx] = text
+        self._save_vault()
 
         vec = self.get_embedding(text)
-        if vec is not None and vec.shape[-1] == self.dimension:
+        if self.faiss_index is not None and vec is not None and vec.shape[-1] == self.dimension:
             try:
                 self.faiss_index.add(vec)
             except Exception as e:
