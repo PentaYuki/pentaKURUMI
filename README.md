@@ -611,7 +611,6 @@ python ai_server.py
 Dự án được phát triển bởi **gooleseswsq1**. Mọi ý kiến đóng góp về hệ thống hormone, cải thiện giọng nói, hoặc tính năng mới đều được chào đón!
 
 ### Liên hệ
-- GitHub: [PentaYuki/Pentamiv1](https://github.com/PentaYuki/Pentamiv1)
 - Issues: [Report bugs & feature requests](https://github.com/PentaYuki/Pentamiv1/issues)
 
 ---
